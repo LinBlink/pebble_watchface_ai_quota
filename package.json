@@ -1,0 +1,46 @@
+{
+  "name": "quota-watchface",
+  "author": "LongLive",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "AI Quota",
+    "uuid": "8083f2df-8a08-4dbf-b8fe-922936e6ab1e",
+    "sdkVersion": "3",
+    "targetPlatforms": [
+      "basalt"
+    ],
+    "watchapp": {
+      "watchface": true
+    },
+    "messageKeys": [
+      "CLAUDE_5H_PCT",
+      "CLAUDE_5H_RESET",
+      "CLAUDE_WK_PCT",
+      "CLAUDE_WK_RESET",
+      "MINIMAX_5H_PCT",
+      "MINIMAX_5H_RESET",
+      "MINIMAX_WK_PCT",
+      "MINIMAX_WK_RESET",
+      "WX_TEMP_NOW",
+      "WX_CODE_NOW",
+      "WX_TEMP_6H",
+      "WX_CODE_6H",
+      "WX_TEMP_24H",
+      "WX_CODE_24H",
+      "REQUEST_REFRESH"
+    ],
+    "capabilities": ["configurable", "location"],
+    "resources": {
+      "media": [
+        {
+          "type": "png",
+          "name": "IMAGE_MENU_ICON",
+          "file": "images/menu_icon.png"
+        }
+      ]
+    }
+  }
+}

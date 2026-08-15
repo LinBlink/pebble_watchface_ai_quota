@@ -1,0 +1,9 @@
+# Live credentials — never commit these.
+# src/pkjs/pebble-js-app.js is generated from src/pkjs-template/index.js by
+# tools/make_secrets.py, with the tokens inlined. Edit the template.
+config.json
+src/pkjs/*.js
+
+build/
+*.pbw
+.lock-waf_*
