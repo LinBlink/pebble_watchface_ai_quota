@@ -39,7 +39,8 @@ var DEFAULTS = {
   refreshMin: 5,
   units: 'celsius',   // or 'fahrenheit'
   lat: '',            // blank = use phone GPS
-  lon: ''
+  lon: '',
+  targetDate: ''      // 'YYYY-MM-DD' for the day counter; blank hides it
 };
 
 var DEFAULT_QUOTA_REFRESH_MIN = 5;
@@ -64,6 +65,12 @@ var TOKEN_EARLY_REFRESH_MS = 5 * 60 * 1000;
 
 var lastQuotaFetch = 0;
 
+// The usage endpoint rate-limits, and the watch can ask for a refresh on every
+// wrist flick and reconnect. Without a backoff those requests keep the limit
+// alive; MiniMax and weather carry on regardless.
+var CLAUDE_BACKOFF_MS = 15 * 60 * 1000;
+var claudeBackoffUntil = 0;
+
 function getSettings() {
   var raw = localStorage.getItem('settings');
   var s = {};
@@ -77,8 +84,23 @@ function getSettings() {
     refreshMin: s.refreshMin || DEFAULTS.refreshMin || DEFAULT_QUOTA_REFRESH_MIN,
     units: units === 'fahrenheit' ? 'fahrenheit' : 'celsius',
     lat: s.lat || DEFAULTS.lat,
-    lon: s.lon || DEFAULTS.lon
+    lon: s.lon || DEFAULTS.lon,
+    targetDate: s.targetDate || DEFAULTS.targetDate
   };
+}
+
+// The watch counts the days down itself, so it only needs the target once —
+// as local midnight, which is the boundary it ticks over on. Sending 0 clears
+// it, otherwise clearing the field in settings would leave the old date stuck.
+function sendTargetDate() {
+  var raw = getSettings().targetDate;
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw || '');
+  if (!m) {
+    send({ TARGET_DATE: 0 });
+    return;
+  }
+  var midnight = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  send({ TARGET_DATE: Math.floor(midnight.getTime() / 1000) });
 }
 
 function saveSettings(s) {
@@ -259,6 +281,7 @@ function claudeWindow(block) {
 }
 
 function fetchClaude(retrying) {
+  if (Date.now() < claudeBackoffUntil) return;
   withClaudeToken(function (token) {
     if (!token) return;
     getJSON(CLAUDE_USAGE_URL,
@@ -270,6 +293,12 @@ function fetchClaude(retrying) {
         send(msg);
       },
       function (status) {
+        if (status === 429) {
+          claudeBackoffUntil = Date.now() + CLAUDE_BACKOFF_MS;
+          console.log('claude: rate limited — pausing for ' +
+                      (CLAUDE_BACKOFF_MS / 60000) + ' min');
+          return;
+        }
         // A token can be rejected before its stated expiry — refresh once and retry.
         if (status === 401 && !retrying) {
           refreshClaudeToken(function (fresh) { if (fresh) fetchClaude(true); });
@@ -449,6 +478,7 @@ function refreshWeather() {
 
 Pebble.addEventListener('ready', function () {
   var cfg = getSettings();
+  sendTargetDate();
   refreshQuotas(true);
   refreshWeather();
   setInterval(function () { refreshQuotas(true); },
@@ -484,6 +514,8 @@ function configPage(cfg) {
     '</style></head><body><h1>AI Quota</h1>' +
     '<p>Quotas come straight from the phone. Leave the collector URL blank unless ' +
     'you run tools/quota_collector.py.</p>' +
+    '<label>Countdown target date (blank = hide)</label>' +
+    '<input id="targetDate" type="date" value="' + cfg.targetDate + '">' +
     '<label>Weather latitude (blank = phone GPS)</label>' +
     '<input id="lat" value="' + cfg.lat + '">' +
     '<label>Weather longitude</label><input id="lon" value="' + cfg.lon + '">' +
@@ -499,7 +531,7 @@ function configPage(cfg) {
     'document.getElementById("save").onclick=function(){' +
     'var g=function(i){return document.getElementById(i).value.trim()};' +
     'var out={url:g("url"),token:g("token"),refreshMin:parseInt(g("refreshMin"),10)||5,' +
-    'units:g("units"),lat:g("lat"),lon:g("lon")};' +
+    'units:g("units"),lat:g("lat"),lon:g("lon"),targetDate:g("targetDate")};' +
     'location.href="pebblejs://close#"+encodeURIComponent(JSON.stringify(out))};' +
     '<\/script></body></html>';
 }
@@ -510,7 +542,7 @@ function collectorConfigUrl(cfg) {
   if (!m) return null;
   var current = {
     url: cfg.url, token: cfg.token, refreshMin: cfg.refreshMin,
-    units: cfg.units, lat: cfg.lat, lon: cfg.lon
+    units: cfg.units, lat: cfg.lat, lon: cfg.lon, targetDate: cfg.targetDate
   };
   return m[1] + '/config?current=' + encodeURIComponent(JSON.stringify(current));
 }
@@ -535,6 +567,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
   if (!e.response) return;
   try {
     saveSettings(JSON.parse(decodeURIComponent(e.response)));
+    sendTargetDate();
     refreshQuotas(true);
     refreshWeather();
   } catch (err) {

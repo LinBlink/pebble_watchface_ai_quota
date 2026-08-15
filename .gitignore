@@ -1,9 +1,46 @@
-# Live credentials — never commit these.
-# src/pkjs/pebble-js-app.js is generated from src/pkjs-template/index.js by
-# tools/make_secrets.py, with the tokens inlined. Edit the template.
+# ===== Secrets & credentials — never commit these =====
+# config.json holds live MiniMax API keys and Claude session cookies.
 config.json
-src/pkjs/*.js
 
+# Local-only tool settings (OpenAI Codex / opencode / Claude Code permission rules).
+.claude/
+.opencode/
+.codex/
+.windsurf/
+.vscode/
+
+# Environment / secret dotfiles.
+.env
+.env.*
+*.secret
+*.token
+*.key
+*.pem
+
+# ===== Generated code with inlined credentials =====
+# src/pkjs/pebble-js-app.js is derived from src/pkjs-template/index.js by
+# tools/make_secrets.py, which inlines the live tokens. Edit the template.
+src/pkjs/
+
+# ===== Build output =====
 build/
 *.pbw
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.map
+.waf-*
 .lock-waf_*
+*.pyc
+__pycache__/
+
+# ===== Screenshots / local artifacts =====
+shot*.png
+*.log
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db

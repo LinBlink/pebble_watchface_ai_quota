@@ -30,7 +30,8 @@
       "WX_CODE_6H",
       "WX_TEMP_24H",
       "WX_CODE_24H",
-      "REQUEST_REFRESH"
+      "REQUEST_REFRESH",
+      "TARGET_DATE"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {
