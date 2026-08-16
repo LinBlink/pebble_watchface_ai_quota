@@ -40,7 +40,9 @@ var DEFAULTS = {
   units: 'celsius',   // or 'fahrenheit'
   lat: '',            // blank = use phone GPS
   lon: '',
-  targetDate: ''      // 'YYYY-MM-DD' for the day counter; blank hides it
+  targetDate: '',     // 'YYYY-MM-DD' for the day counter; blank hides it
+  theme: 'light',     // or 'dark'
+  timeFont: 'bitham'  // or 'consolas' — Consolas-like digits for the clock
 };
 
 var DEFAULT_QUOTA_REFRESH_MIN = 5;
@@ -78,6 +80,8 @@ function getSettings() {
     try { s = JSON.parse(raw); } catch (e) { s = {}; }
   }
   var units = s.units || DEFAULTS.units;
+  var theme = s.theme || DEFAULTS.theme;
+  var timeFont = s.timeFont || DEFAULTS.timeFont;
   return {
     url: s.url || DEFAULTS.url,
     token: s.token || DEFAULTS.token,
@@ -85,7 +89,9 @@ function getSettings() {
     units: units === 'fahrenheit' ? 'fahrenheit' : 'celsius',
     lat: s.lat || DEFAULTS.lat,
     lon: s.lon || DEFAULTS.lon,
-    targetDate: s.targetDate || DEFAULTS.targetDate
+    targetDate: s.targetDate || DEFAULTS.targetDate,
+    theme: theme === 'dark' ? 'dark' : 'light',
+    timeFont: timeFont === 'consolas' ? 'consolas' : 'bitham'
   };
 }
 
@@ -101,6 +107,16 @@ function sendTargetDate() {
   }
   var midnight = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
   send({ TARGET_DATE: Math.floor(midnight.getTime() / 1000) });
+}
+
+// Appearance lives on the watch, so the watch needs it even when no data has
+// been pushed yet — send it on every boot and after every settings save.
+function sendAppearance() {
+  var cfg = getSettings();
+  send({
+    THEME: cfg.theme === 'dark' ? 1 : 0,
+    TIME_FONT: cfg.timeFont === 'consolas' ? 1 : 0
+  });
 }
 
 function saveSettings(s) {
@@ -281,9 +297,16 @@ function claudeWindow(block) {
 }
 
 function fetchClaude(retrying) {
-  if (Date.now() < claudeBackoffUntil) return;
+  if (Date.now() < claudeBackoffUntil) {
+    console.log('claude: skipping fetch — backed off for another ' +
+                Math.ceil((claudeBackoffUntil - Date.now()) / 1000) + 's');
+    return;
+  }
   withClaudeToken(function (token) {
-    if (!token) return;
+    if (!token) {
+      console.log('claude: no usable token — skipping fetch (rows will stay stuck at their last value)');
+      return;
+    }
     getJSON(CLAUDE_USAGE_URL,
       { Authorization: 'Bearer ' + token, 'anthropic-beta': 'oauth-2025-04-20' },
       function (raw) {
@@ -302,7 +325,9 @@ function fetchClaude(retrying) {
         // A token can be rejected before its stated expiry — refresh once and retry.
         if (status === 401 && !retrying) {
           refreshClaudeToken(function (fresh) { if (fresh) fetchClaude(true); });
+          return;
         }
+        console.log('claude: fetch failed with status ' + status + ' — rows will stay stuck at their last value');
       });
   });
 }
@@ -478,6 +503,7 @@ function refreshWeather() {
 
 Pebble.addEventListener('ready', function () {
   var cfg = getSettings();
+  sendAppearance();
   sendTargetDate();
   refreshQuotas(true);
   refreshWeather();
@@ -523,6 +549,14 @@ function configPage(cfg) {
     '<option value="celsius"' + (cfg.units === 'celsius' ? ' selected' : '') + '>°C</option>' +
     '<option value="fahrenheit"' + (cfg.units === 'fahrenheit' ? ' selected' : '') + '>°F</option>' +
     '</select>' +
+    '<label>Theme</label><select id="theme">' +
+    '<option value="light"' + (cfg.theme === 'light' ? ' selected' : '') + '>Light</option>' +
+    '<option value="dark"' + (cfg.theme === 'dark' ? ' selected' : '') + '>Dark</option>' +
+    '</select>' +
+    '<label>Clock font</label><select id="timeFont">' +
+    '<option value="bitham"' + (cfg.timeFont === 'bitham' ? ' selected' : '') + '>Bitham</option>' +
+    '<option value="consolas"' + (cfg.timeFont === 'consolas' ? ' selected' : '') + '>Consolas</option>' +
+    '</select>' +
     '<label>Refresh interval (minutes)</label>' +
     '<input id="refreshMin" type="number" min="1" value="' + cfg.refreshMin + '">' +
     '<label>Collector URL (optional)</label><input id="url" value="' + cfg.url + '">' +
@@ -531,7 +565,8 @@ function configPage(cfg) {
     'document.getElementById("save").onclick=function(){' +
     'var g=function(i){return document.getElementById(i).value.trim()};' +
     'var out={url:g("url"),token:g("token"),refreshMin:parseInt(g("refreshMin"),10)||5,' +
-    'units:g("units"),lat:g("lat"),lon:g("lon"),targetDate:g("targetDate")};' +
+    'units:g("units"),lat:g("lat"),lon:g("lon"),targetDate:g("targetDate"),' +
+    'theme:g("theme"),timeFont:g("timeFont")};' +
     'location.href="pebblejs://close#"+encodeURIComponent(JSON.stringify(out))};' +
     '<\/script></body></html>';
 }
@@ -542,7 +577,8 @@ function collectorConfigUrl(cfg) {
   if (!m) return null;
   var current = {
     url: cfg.url, token: cfg.token, refreshMin: cfg.refreshMin,
-    units: cfg.units, lat: cfg.lat, lon: cfg.lon, targetDate: cfg.targetDate
+    units: cfg.units, lat: cfg.lat, lon: cfg.lon, targetDate: cfg.targetDate,
+    theme: cfg.theme, timeFont: cfg.timeFont
   };
   return m[1] + '/config?current=' + encodeURIComponent(JSON.stringify(current));
 }
@@ -567,6 +603,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
   if (!e.response) return;
   try {
     saveSettings(JSON.parse(decodeURIComponent(e.response)));
+    sendAppearance();
     sendTargetDate();
     refreshQuotas(true);
     refreshWeather();

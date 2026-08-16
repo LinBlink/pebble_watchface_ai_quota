@@ -33,8 +33,10 @@ static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
 #define PERSIST_RESET(i)   (100 + (i) * 2 + 1)
 #define PERSIST_TEMP(i)    (200 + (i) * 2)
 #define PERSIST_CODE(i)    (200 + (i) * 2 + 1)
-#define PERSIST_LAST_SYNC  300
+#define PERSIST_LAST_SYNC(p) (320 + (p))  // 0 = claude, 1 = minimax
 #define PERSIST_TARGET     301
+#define PERSIST_THEME      310
+#define PERSIST_TIME_FONT  311
 #define PERSIST_ALERTED(i) (400 + (i))
 
 // Buzz once when a quota first crosses this. Persisted per row so a restart
@@ -50,12 +52,63 @@ static int32_t s_pct[ROW_COUNT];     // -1 = no data yet
 static int32_t s_reset[ROW_COUNT];   // absolute UTC epoch seconds of next reset
 static int32_t s_temp[WX_COUNT];     // NO_TEMP = no data yet
 static int32_t s_code[WX_COUNT];     // WMO weather code
-static int32_t s_last_sync;          // UTC epoch of the last quota push, 0 = never
+// UTC epoch of the last quota push per provider (0 = claude, 1 = minimax), 0 =
+// never. Tracked separately because the two providers fail independently — if
+// only one of them is actually landing pushes, its rows must grey out on their
+// own instead of being propped up by the other provider's traffic.
+static int32_t s_last_sync[2];
 static bool s_refresh_pending;       // a refresh was asked for and hasn't landed yet
 static int32_t s_target_date;        // local midnight of the countdown target, 0 = unset
 static bool s_alerted[ROW_COUNT];    // this row has already buzzed for its current window
 
+// Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
+// clock face font. Defaults match the phone-side DEFAULTS so a fresh install
+// looks right even before the first AppMessage lands.
+static int32_t s_theme;              // 0 = light, 1 = dark
+static int32_t s_time_font;          // 0 = bitham, 1 = consolas
+
+// Every colour on screen comes from one of these two palettes, so the whole
+// face flips with a single value. Accent is the warm "attention" colour (sun,
+// countdown, low battery, refresh in flight): yellow pops on dark, orange on
+// light. The bolt stays yellow on both, since it always sits on the dark storm
+// cloud, and the no-data placeholder / storm cloud / unknown icon are the same
+// dark grey in either theme.
+typedef struct {
+  GColor bg;           // window background
+  GColor fg;           // primary text (clock, temps, percentages)
+  GColor fg_dim;       // secondary text (date, labels, resets)
+  GColor stale;        // quota number when the last sync is too old
+  GColor separator;    // 1px rules
+  GColor gauge_track;  // empty part of the quota bars
+  GColor batt_outline; // battery case
+  GColor cloud;        // weather cloud bodies
+  GColor fog;          // fog strokes
+  GColor snow;         // snow strokes
+  GColor accent;       // sun, countdown, low battery, pending refresh
+  GColor bolt;         // storm bolt
+} Theme;
+
+static const Theme THEMES[2] = {
+  { // light
+    .bg = GColorWhite,      .fg = GColorBlack,
+    .fg_dim = GColorDarkGray, .stale = GColorDarkGray,
+    .separator = GColorLightGray, .gauge_track = GColorLightGray,
+    .batt_outline = GColorDarkGray, .cloud = GColorDarkGray,
+    .fog = GColorDarkGray, .snow = GColorDarkGray,
+    .accent = GColorOrange, .bolt = GColorYellow,
+  },
+  { // dark
+    .bg = GColorBlack,      .fg = GColorWhite,
+    .fg_dim = GColorLightGray, .stale = GColorLightGray,
+    .separator = GColorDarkGray, .gauge_track = GColorDarkGray,
+    .batt_outline = GColorLightGray, .cloud = GColorLightGray,
+    .fog = GColorLightGray, .snow = GColorWhite,
+    .accent = GColorYellow, .bolt = GColorYellow,
+  },
+};
+
 static Window *s_window;
+static GFont s_consolas_font;          // loaded at window_load, freed at unload
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
@@ -144,8 +197,8 @@ static char s_reset_buf[ROW_COUNT][10];
 //
 // Drawn from primitives rather than shipped as images. Eight 22x22 PNGs would
 // be eight resources to keep aligned with each other, and each would need its
-// own palette; drawing them means the sun is yellow and the rain blue for free,
-// and the whole set costs no space in the .pbw.
+// own palette; drawing them means the sun is the accent colour and the rain
+// blue for free, and the whole set costs no space in the .pbw.
 
 typedef enum {
   WX_SUN, WX_SUN_CLOUD, WX_CLOUD, WX_FOG,
@@ -181,10 +234,10 @@ static const GPathInfo BOLT_INFO = {
 };
 
 static void draw_sun(GContext *ctx, GPoint c, int r, bool rays) {
-  graphics_context_set_fill_color(ctx, GColorYellow);
+  graphics_context_set_fill_color(ctx, THEMES[s_theme].accent);
   graphics_fill_circle(ctx, c, r);
   if (!rays) return;
-  graphics_context_set_stroke_color(ctx, GColorYellow);
+  graphics_context_set_stroke_color(ctx, THEMES[s_theme].accent);
   for (int i = 0; i < 8; i++) {
     GPoint d = SUN_RAYS[i];
     graphics_draw_line(ctx,
@@ -213,7 +266,7 @@ static void draw_rain(GContext *ctx, int x, int y, int len) {
 }
 
 static void draw_snow(GContext *ctx, int x, int y) {
-  graphics_context_set_stroke_color(ctx, GColorWhite);
+  graphics_context_set_stroke_color(ctx, THEMES[s_theme].snow);
   for (int i = 0; i < 3; i++) {
     int sx = x + 6 + i * 5;
     graphics_draw_line(ctx, GPoint(sx - 2, y + 2), GPoint(sx + 2, y + 2));
@@ -223,7 +276,7 @@ static void draw_snow(GContext *ctx, int x, int y) {
 
 // Staggered horizontal bars — the one condition with no cloud silhouette.
 static void draw_fog(GContext *ctx, int x, int y) {
-  graphics_context_set_stroke_color(ctx, GColorLightGray);
+  graphics_context_set_stroke_color(ctx, THEMES[s_theme].fog);
   for (int i = 0; i < 4; i++) {
     int ly = y + 5 + i * 4;
     int inset = (i % 2) ? 5 : 2;
@@ -239,30 +292,30 @@ static void draw_wx_icon(GContext *ctx, int x, int y, WxIcon icon) {
     case WX_SUN_CLOUD:
       // Sun first, so the cloud occludes it rather than the other way round.
       draw_sun(ctx, GPoint(x + 15, y + 6), 4, true);
-      draw_cloud(ctx, x, y + 7, 14, GColorLightGray);
+      draw_cloud(ctx, x, y + 7, 14, THEMES[s_theme].cloud);
       break;
     case WX_CLOUD:
-      draw_cloud(ctx, x, y + 4, 16, GColorLightGray);
+      draw_cloud(ctx, x, y + 4, 16, THEMES[s_theme].cloud);
       break;
     case WX_FOG:
       draw_fog(ctx, x, y);
       break;
     case WX_DRIZZLE:
-      draw_cloud(ctx, x, y, 14, GColorLightGray);
+      draw_cloud(ctx, x, y, 14, THEMES[s_theme].cloud);
       draw_rain(ctx, x, y + 16, 3);
       break;
     case WX_RAIN:
-      draw_cloud(ctx, x, y, 14, GColorLightGray);
+      draw_cloud(ctx, x, y, 14, THEMES[s_theme].cloud);
       draw_rain(ctx, x, y + 14, 6);
       break;
     case WX_SNOW:
-      draw_cloud(ctx, x, y, 13, GColorLightGray);
+      draw_cloud(ctx, x, y, 13, THEMES[s_theme].cloud);
       draw_snow(ctx, x, y + 14);
       break;
     case WX_STORM:
       // Darker cloud, so the yellow bolt in front of it carries the contrast.
       draw_cloud(ctx, x, y, 12, GColorDarkGray);
-      graphics_context_set_fill_color(ctx, GColorYellow);
+      graphics_context_set_fill_color(ctx, THEMES[s_theme].bolt);
       gpath_move_to(s_bolt, GPoint(x + 7, y + 8));
       gpath_draw_filled(ctx, s_bolt);
       break;
@@ -307,16 +360,18 @@ static void fmt_remaining(char *out, size_t out_len, int32_t seconds_left) {
   }
 }
 
-static bool data_is_stale(time_t now) {
-  return s_last_sync <= 0 || (int32_t)now - s_last_sync > STALE_AFTER_SEC;
+static bool data_is_stale(time_t now, int provider) {
+  int32_t last = s_last_sync[provider];
+  return last <= 0 || (int32_t)now - last > STALE_AFTER_SEC;
 }
 
 static void update_rows(time_t now) {
-  bool stale = data_is_stale(now);
-
   for (int i = 0; i < ROW_COUNT; i++) {
+    bool stale = data_is_stale(now, ROWS[i].is_claude ? 0 : 1);
+
     if (s_pct[i] < 0) {
       snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "--");
+      // The placeholder is the same dark grey in both themes.
       text_layer_set_text_color(s_pct_layers[i], GColorDarkGray);
     } else {
       int32_t p = s_pct[i];
@@ -324,7 +379,8 @@ static void update_rows(time_t now) {
       snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "%ld%%", (long)p);
       // Grey means "this number may have moved since we last heard from the phone".
       text_layer_set_text_color(s_pct_layers[i],
-                                stale ? GColorLightGray : (p >= 90 ? GColorRed : GColorWhite));
+                                stale ? THEMES[s_theme].stale
+                                      : (p >= 90 ? GColorRed : THEMES[s_theme].fg));
     }
     text_layer_set_text(s_pct_layers[i], s_pct_buf[i]);
 
@@ -437,7 +493,7 @@ static void rows_update_proc(Layer *layer, GContext *ctx) {
   for (int i = 0; i < ROW_COUNT; i++) {
     int y = i * ROW_H + ROW_H - BAR_H;
 
-    graphics_context_set_fill_color(ctx, GColorDarkGray);
+    graphics_context_set_fill_color(ctx, THEMES[s_theme].gauge_track);
     graphics_fill_rect(ctx, GRect(bar_x, y, bar_w, BAR_H), 0, GCornerNone);
 
     if (s_pct[i] >= 0) {
@@ -455,9 +511,9 @@ static void rows_update_proc(Layer *layer, GContext *ctx) {
 static void draw_battery(GContext *ctx, int x, int y) {
   BatteryChargeState st = battery_state_service_peek();
 
-  graphics_context_set_stroke_color(ctx, GColorLightGray);
+  graphics_context_set_stroke_color(ctx, THEMES[s_theme].batt_outline);
   graphics_draw_rect(ctx, GRect(x, y, BATT_W, BATT_H));
-  graphics_context_set_fill_color(ctx, GColorLightGray);
+  graphics_context_set_fill_color(ctx, THEMES[s_theme].batt_outline);
   graphics_fill_rect(ctx, GRect(x + BATT_W, y + 3, 2, 4), 0, GCornerNone);
 
   GColor fill;
@@ -466,7 +522,7 @@ static void draw_battery(GContext *ctx, int x, int y) {
   } else if (st.charge_percent <= 10) {
     fill = GColorRed;
   } else if (st.charge_percent <= 30) {
-    fill = GColorYellow;
+    fill = THEMES[s_theme].accent;
   } else {
     fill = GColorGreen;
   }
@@ -492,7 +548,7 @@ static void draw_bluetooth(GContext *ctx, int x, int y) {
   if (!connection_service_peek_pebble_app_connection()) {
     color = GColorRed;
   } else if (s_refresh_pending) {
-    color = GColorYellow;
+    color = THEMES[s_theme].accent;
   } else {
     color = GColorPictonBlue;
   }
@@ -513,9 +569,51 @@ static void status_update_proc(Layer *layer, GContext *ctx) {
 // custom Layer with its own update_proc.
 static TextLayer *separator(Layer *root, int y) {
   TextLayer *tl = text_layer_create(GRect(0, y, SCREEN_W, 1));
-  text_layer_set_background_color(tl, GColorDarkGray);
+  text_layer_set_background_color(tl, THEMES[s_theme].separator);
   layer_add_child(root, text_layer_get_layer(tl));
   return tl;
+}
+
+// The clock font is a setting: Bitham 34 (default) or the bundled Consolas-like
+// digits. Custom fonts are loaded by handle rather than by FONT_KEY string.
+static GFont time_font(void) {
+  return s_time_font ? s_consolas_font
+                     : fonts_get_system_font(FONT_KEY_BITHAM_34_MEDIUM_NUMBERS);
+}
+
+// Push the active palette and clock font into every layer. Idempotent, so it is
+// fine to call on every inbox message — the layers were built with the persisted
+// theme at window_load, and this only re-colours the ones that changed.
+static void apply_theme(void) {
+  const Theme *t = &THEMES[s_theme];
+
+  window_set_background_color(s_window, t->bg);
+  text_layer_set_text_color(s_time_layer, t->fg);
+  text_layer_set_font(s_time_layer, time_font());
+
+  text_layer_set_text_color(s_date_layer, t->fg_dim);
+  text_layer_set_text_color(s_countdown_layer, t->accent);
+  text_layer_set_text_color(s_ampm_layer, t->fg_dim);
+  text_layer_set_text_color(s_dday_layer, t->fg);
+
+  for (int i = 0; i < WX_COUNT; i++) {
+    text_layer_set_text_color(s_wx_label_layers[i], t->fg_dim);
+    text_layer_set_text_color(s_wx_temp_layers[i], t->fg);
+  }
+
+  text_layer_set_background_color(s_separators[0], t->separator);
+  text_layer_set_background_color(s_separators[1], t->separator);
+
+  for (int i = 0; i < ROW_COUNT; i++) {
+    text_layer_set_text_color(s_label_layers[i], row_color(i));
+    text_layer_set_text_color(s_reset_layers[i], t->fg_dim);
+  }
+
+  // update_rows() owns the percentage colour (placeholder / stale / normal),
+  // so re-run it to pick up the new palette, then redraw the drawn layers.
+  update_rows(time(NULL));
+  layer_mark_dirty(s_status_layer);
+  layer_mark_dirty(s_wx_icons_layer);
 }
 
 // ------------------------------------------------------------------ app msg
@@ -585,15 +683,27 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *target = dict_find(it, MESSAGE_KEY_TARGET_DATE);
   if (target) store_int(PERSIST_TARGET, &s_target_date, target->value->int32);
 
+  // Appearance settings; anything present overrides the persisted value.
+  Tuple *theme = dict_find(it, MESSAGE_KEY_THEME);
+  if (theme) store_int(PERSIST_THEME, &s_theme, theme->value->int32);
+  Tuple *time_font = dict_find(it, MESSAGE_KEY_TIME_FONT);
+  if (time_font) store_int(PERSIST_TIME_FONT, &s_time_font, time_font->value->int32);
+
   // Only a quota push counts as a sync — a weather-only message says nothing
-  // about how fresh the percentages are.
-  if (dict_find(it, MESSAGE_KEY_CLAUDE_5H_PCT) || dict_find(it, MESSAGE_KEY_MINIMAX_5H_PCT)) {
-    store_int(PERSIST_LAST_SYNC, &s_last_sync, (int32_t)time(NULL));
+  // about how fresh the percentages are. Tracked per provider: MiniMax landing
+  // fine must not paper over Claude silently failing to push, or vice versa.
+  time_t now = time(NULL);
+  if (dict_find(it, MESSAGE_KEY_CLAUDE_5H_PCT) || dict_find(it, MESSAGE_KEY_CLAUDE_WK_PCT)) {
+    store_int(PERSIST_LAST_SYNC(0), &s_last_sync[0], (int32_t)now);
+  }
+  if (dict_find(it, MESSAGE_KEY_MINIMAX_5H_PCT) || dict_find(it, MESSAGE_KEY_MINIMAX_WK_PCT)) {
+    store_int(PERSIST_LAST_SYNC(1), &s_last_sync[1], (int32_t)now);
   }
 
   s_refresh_pending = false;
   layer_mark_dirty(s_status_layer);
   check_quota_alerts();
+  apply_theme();
   update_ui();
 }
 
@@ -610,8 +720,12 @@ static void load_persisted(void) {
     s_temp[i] = persist_exists(PERSIST_TEMP(i)) ? persist_read_int(PERSIST_TEMP(i)) : NO_TEMP;
     s_code[i] = persist_exists(PERSIST_CODE(i)) ? persist_read_int(PERSIST_CODE(i)) : -1;
   }
-  s_last_sync = persist_exists(PERSIST_LAST_SYNC) ? persist_read_int(PERSIST_LAST_SYNC) : 0;
+  for (int p = 0; p < 2; p++) {
+    s_last_sync[p] = persist_exists(PERSIST_LAST_SYNC(p)) ? persist_read_int(PERSIST_LAST_SYNC(p)) : 0;
+  }
   s_target_date = persist_exists(PERSIST_TARGET) ? persist_read_int(PERSIST_TARGET) : 0;
+  s_theme = persist_exists(PERSIST_THEME) ? persist_read_int(PERSIST_THEME) : 0;
+  s_time_font = persist_exists(PERSIST_TIME_FONT) ? persist_read_int(PERSIST_TIME_FONT) : 0;
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
   }
@@ -619,10 +733,10 @@ static void load_persisted(void) {
 
 // ------------------------------------------------------------------- window
 
-static TextLayer *make_text(Layer *root, GRect frame, const char *font_key,
+static TextLayer *make_text(Layer *root, GRect frame, GFont font,
                             GTextAlignment align, GColor color) {
   TextLayer *tl = text_layer_create(frame);
-  text_layer_set_font(tl, fonts_get_system_font(font_key));
+  text_layer_set_font(tl, font);
   text_layer_set_text_alignment(tl, align);
   text_layer_set_background_color(tl, GColorClear);
   text_layer_set_text_color(tl, color);
@@ -632,17 +746,22 @@ static TextLayer *make_text(Layer *root, GRect frame, const char *font_key,
 
 static void window_load(Window *window) {
   Layer *root = window_get_root_layer(window);
-  window_set_background_color(window, GColorBlack);
+  window_set_background_color(window, THEMES[s_theme].bg);
+
+  s_consolas_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_CONSOLAS_38));
 
   s_time_layer = make_text(root, GRect(0, TIME_Y, SCREEN_W, TIME_H),
-                           FONT_KEY_BITHAM_34_MEDIUM_NUMBERS, GTextAlignmentCenter, GColorWhite);
+                           time_font(), GTextAlignmentCenter, THEMES[s_theme].fg);
 
   s_date_layer = make_text(root, GRect(DATE_X, DATE_Y, DATE_W, DATE_H),
-                           FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentLeft, GColorLightGray);
+                           fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                           GTextAlignmentLeft, THEMES[s_theme].fg_dim);
 
-  // Countdown to 22:00, in yellow so it reads as a deadline rather than a clock.
+  // Countdown to 22:00, in the accent colour so it reads as a deadline rather
+  // than a clock (yellow on dark, orange on light).
   s_countdown_layer = make_text(root, GRect(SCREEN_W - CD_W - DATE_X, DATE_Y, CD_W, DATE_H),
-                                FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentRight, GColorYellow);
+                                fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                                GTextAlignmentRight, THEMES[s_theme].accent);
 
   // Battery and Bluetooth share one layer spanning the top strip, so their
   // coordinates stay screen coordinates and stay comparable with the clock's.
@@ -651,13 +770,15 @@ static void window_load(Window *window) {
   layer_add_child(root, s_status_layer);
 
   s_ampm_layer = make_text(root, GRect(AMPM_X, AMPM_Y, AMPM_W, CORNER_H),
-                           FONT_KEY_GOTHIC_14_BOLD, GTextAlignmentLeft, GColorLightGray);
+                           fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                           GTextAlignmentLeft, THEMES[s_theme].fg_dim);
   text_layer_set_text(s_ampm_layer, "");
 
   // Just the number, per the brief — the target date lives in the phone's
   // settings page and is the only place it needs spelling out.
   s_dday_layer = make_text(root, GRect(DDAY_X, DDAY_Y, DDAY_W, CORNER_H),
-                           FONT_KEY_GOTHIC_14_BOLD, GTextAlignmentRight, GColorWhite);
+                           fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                           GTextAlignmentRight, THEMES[s_theme].fg);
   text_layer_set_text(s_dday_layer, "");
 
   s_separators[0] = separator(root, SEP1_Y);
@@ -667,12 +788,14 @@ static void window_load(Window *window) {
   for (int i = 0; i < WX_COUNT; i++) {
     int x = i * WX_COL_W;
     s_wx_label_layers[i] = make_text(root, GRect(x, WX_LABEL_Y, WX_COL_W, WX_LABEL_H),
-                                     FONT_KEY_GOTHIC_14, GTextAlignmentCenter, GColorLightGray);
+                                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                                     GTextAlignmentCenter, THEMES[s_theme].fg_dim);
     text_layer_set_text(s_wx_label_layers[i], WX_LABELS[i]);
 
     s_wx_temp_layers[i] = make_text(root,
                                     GRect(x + WX_TEMP_X, WX_ICON_Y + 1, WX_TEMP_W, WX_TEMP_H),
-                                    FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentCenter, GColorWhite);
+                                    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                                    GTextAlignmentCenter, THEMES[s_theme].fg);
     text_layer_set_text(s_wx_temp_layers[i], "--");
   }
 
@@ -690,17 +813,20 @@ static void window_load(Window *window) {
     int y = i * ROW_H;
 
     s_label_layers[i] = make_text(s_rows_layer, GRect(R_LABEL_X, y + TEXT_DY, R_LABEL_W, ROW_H),
-                                  FONT_KEY_GOTHIC_14_BOLD, GTextAlignmentLeft, row_color(i));
+                                  fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                                  GTextAlignmentLeft, row_color(i));
     text_layer_set_text(s_label_layers[i], ROWS[i].label);
 
     s_pct_layers[i] = make_text(s_rows_layer,
                                 GRect(R_LABEL_X + R_LABEL_W, y + PCT_DY, R_PCT_W, ROW_H + 4),
-                                FONT_KEY_GOTHIC_18_BOLD, GTextAlignmentRight, GColorWhite);
+                                fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                                GTextAlignmentRight, THEMES[s_theme].fg);
     text_layer_set_text(s_pct_layers[i], "--");
 
     s_reset_layers[i] = make_text(s_rows_layer,
                                   GRect(R_LABEL_X + R_LABEL_W + R_PCT_W, y + TEXT_DY, R_RESET_W, ROW_H),
-                                  FONT_KEY_GOTHIC_14, GTextAlignmentRight, GColorLightGray);
+                                  fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                                  GTextAlignmentRight, THEMES[s_theme].fg_dim);
     text_layer_set_text(s_reset_layers[i], "--");
   }
 
@@ -719,6 +845,7 @@ static void window_unload(Window *window) {
   }
   layer_destroy(s_wx_icons_layer);
   gpath_destroy(s_bolt);
+  fonts_unload_custom_font(s_consolas_font);
   layer_destroy(s_rows_layer);
   layer_destroy(s_status_layer);
   text_layer_destroy(s_separators[0]);
@@ -736,9 +863,11 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   update_dday(time(NULL));
   update_rows(time(NULL));
 
-  // Nudge the phone as soon as the data would otherwise go grey, so a watchface
-  // left on the wrist keeps itself current without waiting for the JS interval.
-  if (data_is_stale(time(NULL))) request_refresh();
+  // Nudge the phone as soon as either provider's data would otherwise go grey,
+  // so a watchface left on the wrist keeps itself current without waiting for
+  // the JS interval.
+  time_t n = time(NULL);
+  if (data_is_stale(n, 0) || data_is_stale(n, 1)) request_refresh();
 }
 
 // Flick of the wrist forces an immediate fetch.

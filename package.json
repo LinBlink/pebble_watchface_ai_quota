@@ -31,7 +31,9 @@
       "WX_TEMP_24H",
       "WX_CODE_24H",
       "REQUEST_REFRESH",
-      "TARGET_DATE"
+      "TARGET_DATE",
+      "THEME",
+      "TIME_FONT"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {
@@ -40,6 +42,14 @@
           "type": "png",
           "name": "IMAGE_MENU_ICON",
           "file": "images/menu_icon.png"
+        },
+        {
+          "type": "font",
+          "name": "FONT_CONSOLAS_38",
+          "file": "fonts/consolas.ttf",
+          "characterRegex": "[0-9:]",
+          "pixelHeight": 36,
+          "trackingAdjust": -1
         }
       ]
     }

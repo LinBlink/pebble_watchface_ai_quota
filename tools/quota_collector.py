@@ -242,6 +242,12 @@ blank to use phone GPS.</p>
 <label>Units</label><select id="units">
 <option value="celsius">Celsius</option><option value="fahrenheit">Fahrenheit</option>
 </select>
+<label>Theme</label><select id="theme">
+<option value="light">Light</option><option value="dark">Dark</option>
+</select>
+<label>Clock font</label><select id="timeFont">
+<option value="bitham">Bitham</option><option value="consolas">Consolas</option>
+</select>
 <label>Latitude (optional)</label><input id="lat" type="text">
 <label>Longitude (optional)</label><input id="lon" type="text">
 <button id="save">Save</button>
@@ -256,13 +262,16 @@ g('url').value = cur.url || '';
 g('token').value = cur.token || '';
 g('refresh').value = cur.refreshMin || 5;
 g('units').value = cur.units || 'celsius';
+g('theme').value = cur.theme || 'light';
+g('timeFont').value = cur.timeFont || 'bitham';
 g('lat').value = cur.lat || '';
 g('lon').value = cur.lon || '';
 g('save').onclick = function () {
   var out = {
     url: g('url').value.trim(), token: g('token').value.trim(),
     refreshMin: parseInt(g('refresh').value, 10) || 5,
-    units: g('units').value, lat: g('lat').value.trim(), lon: g('lon').value.trim()
+    units: g('units').value, lat: g('lat').value.trim(), lon: g('lon').value.trim(),
+    theme: g('theme').value, timeFont: g('timeFont').value
   };
   location.href = 'pebblejs://close#' + encodeURIComponent(JSON.stringify(out));
 };

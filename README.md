@@ -185,8 +185,9 @@ overwritten on every run and is gitignored because it holds live tokens.
 ### Settings
 
 Everything is baked in at build time, so the watchface works with **no settings
-page at all**. The gear icon opens one for later tweaks — refresh interval,
-°C/°F, fixed lat/lon, and the optional collector URL/token.
+page at all**. The gear icon opens one for later tweaks — theme (light/dark),
+clock font (Bitham / Consolas-like digits), refresh interval, °C/°F, fixed
+lat/lon, and the optional collector URL/token.
 
 That page is served as a `data:` URL (with direct fetching there is no collector
 hosting it). Some phone apps refuse to navigate to `data:` URLs; if the gear

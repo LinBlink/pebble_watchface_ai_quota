@@ -23,13 +23,13 @@ to log in again. Re-run this script after any such re-login to re-seed the phone
 """
 
 import json
+import os
 import re
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
 CONFIG = ROOT / "config.json"
 TEMPLATE = ROOT / "src" / "pkjs-template" / "index.js"
 # The name matters. Without "enableMultiJS": true in package.json, the SDK's
@@ -39,6 +39,25 @@ TEMPLATE = ROOT / "src" / "pkjs-template" / "index.js"
 # webpack dependency for a single-file project.
 OUT = ROOT / "src" / "pkjs" / "pebble-js-app.js"
 PLACEHOLDER = "/*__SECRETS__*/{}"
+
+
+def credentials_path():
+    """Locate Claude Code's credentials file.
+
+    Under WSL, Claude Code usually runs on the Windows side, so its tokens live
+    in /mnt/c/Users/<name>/.claude/.credentials.json — not in the WSL home. Fall
+    back to ~/.claude/.credentials.json for native-Linux setups.
+    """
+    candidates = [Path.home() / ".claude" / ".credentials.json"]
+    if Path("/mnt/c/Users").is_dir():
+        # Take the first Windows profile that actually has the file, and prefer
+        # it over the WSL home: that is where Claude Code is keeping the token
+        # fresh, so it is the copy least likely to be rotated-out.
+        candidates += sorted(Path("/mnt/c/Users").glob("*/.claude/.credentials.json"))
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
 
 
 def load_json(path, label):
@@ -57,7 +76,8 @@ def load_json(path, label):
 
 
 def main():
-    oauth = load_json(CREDENTIALS, str(CREDENTIALS)).get("claudeAiOauth") or {}
+    credentials = credentials_path()
+    oauth = load_json(credentials, str(credentials)).get("claudeAiOauth") or {}
     config = load_json(CONFIG, str(CONFIG))
 
     refresh = oauth.get("refreshToken") or ""
@@ -65,7 +85,7 @@ def main():
     expires = oauth.get("expiresAt") or 0
 
     if not refresh:
-        print(f"warning: no claudeAiOauth.refreshToken in {CREDENTIALS} — "
+        print(f"warning: no claudeAiOauth.refreshToken in {credentials} — "
               "the Claude rows will stay blank. Run Claude Code once, then re-run this.")
     minimax = config.get("minimax_key") or ""
     if not minimax:
