@@ -17,13 +17,14 @@
 typedef struct {
   const char *label;
   bool is_claude;
+  bool is_weekly;
 } RowSpec;
 
 static const RowSpec ROWS[ROW_COUNT] = {
-  { "CL 5H", true  },
-  { "CL 7D", true  },
-  { "MM 5H", false },
-  { "MM 7D", false },
+  { "CL 5H", true,  false },
+  { "CL 7D", true,  true  },
+  { "MM 5H", false, false },
+  { "MM 7D", false, true  },
 };
 
 static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
@@ -38,11 +39,16 @@ static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
 #define PERSIST_THEME      310
 #define PERSIST_TIME_FONT  311
 #define PERSIST_ALERTED(i) (400 + (i))
+#define PERSIST_RESET_ALERTED(i) (450 + (i))
 
 // Buzz once when a quota first crosses this. Persisted per row so a restart
 // doesn't re-alert, and cleared when the window resets so the next crossing
 // buzzes again.
 #define ALERT_PCT 80
+
+// Buzz once when a weekly window's reset drops to within a day. Same
+// arm/re-arm persistence pattern as ALERT_PCT above.
+#define RESET_ALERT_SEC (24 * 60 * 60)
 
 // Quota values older than this are shown greyed out: the phone is reachable but
 // the numbers behind them are no longer trustworthy.
@@ -60,6 +66,7 @@ static int32_t s_last_sync[2];
 static bool s_refresh_pending;       // a refresh was asked for and hasn't landed yet
 static int32_t s_target_date;        // local midnight of the countdown target, 0 = unset
 static bool s_alerted[ROW_COUNT];    // this row has already buzzed for its current window
+static bool s_reset_alerted[ROW_COUNT]; // this weekly row has already buzzed for its upcoming reset
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -670,6 +677,28 @@ static void check_quota_alerts(void) {
   if (crossed && !quiet_time_is_active()) vibes_double_pulse();
 }
 
+// Long buzz once a weekly (7D) window's reset drops to within a day out. This
+// is evaluated against the clock, not against incoming pushes, since the
+// countdown moves on its own even between syncs — so it must run every tick,
+// not just from inbox_received. Re-arms once the window actually rolls over
+// (or a fresh push shows the reset pushed back out past a day), so the next
+// week's approach buzzes again.
+static void check_reset_alerts(time_t now) {
+  bool crossed = false;
+
+  for (int i = 0; i < ROW_COUNT; i++) {
+    if (!ROWS[i].is_weekly || s_reset[i] <= 0) continue;
+    int32_t remaining = s_reset[i] - (int32_t)now;
+    bool within = remaining > 0 && remaining <= RESET_ALERT_SEC;
+    if (within == s_reset_alerted[i]) continue;
+    if (within) crossed = true;
+    s_reset_alerted[i] = within;
+    persist_write_bool(PERSIST_RESET_ALERTED(i), within);
+  }
+
+  if (crossed && !quiet_time_is_active()) vibes_long_pulse();
+}
+
 static void inbox_received(DictionaryIterator *it, void *context) {
   apply_quota(it, MESSAGE_KEY_CLAUDE_5H_PCT,  MESSAGE_KEY_CLAUDE_5H_RESET,  0);
   apply_quota(it, MESSAGE_KEY_CLAUDE_WK_PCT,  MESSAGE_KEY_CLAUDE_WK_RESET,  1);
@@ -703,6 +732,7 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   s_refresh_pending = false;
   layer_mark_dirty(s_status_layer);
   check_quota_alerts();
+  check_reset_alerts(now);
   apply_theme();
   update_ui();
 }
@@ -728,6 +758,8 @@ static void load_persisted(void) {
   s_time_font = persist_exists(PERSIST_TIME_FONT) ? persist_read_int(PERSIST_TIME_FONT) : 0;
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
+    s_reset_alerted[i] = persist_exists(PERSIST_RESET_ALERTED(i)) &&
+                          persist_read_bool(PERSIST_RESET_ALERTED(i));
   }
 }
 
@@ -868,6 +900,8 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   // the JS interval.
   time_t n = time(NULL);
   if (data_is_stale(n, 0) || data_is_stale(n, 1)) request_refresh();
+
+  check_reset_alerts(n);
 }
 
 // Flick of the wrist forces an immediate fetch.
