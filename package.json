@@ -16,10 +16,12 @@
       "watchface": true
     },
     "messageKeys": [
-      "CLAUDE_5H_PCT",
       "CLAUDE_5H_RESET",
-      "CLAUDE_WK_PCT",
       "CLAUDE_WK_RESET",
+      "CODEX_5H_PCT",
+      "CODEX_5H_RESET",
+      "CODEX_WK_PCT",
+      "CODEX_WK_RESET",
       "MINIMAX_5H_PCT",
       "MINIMAX_5H_RESET",
       "MINIMAX_WK_PCT",
@@ -33,7 +35,10 @@
       "REQUEST_REFRESH",
       "TARGET_DATE",
       "THEME",
-      "TIME_FONT"
+      "TIME_FONT",
+      "AI_PROVIDER",
+      "GITHUB_TODAY_COMMITS",
+      "GITHUB_LATEST_COMMIT_AT"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {

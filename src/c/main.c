@@ -20,8 +20,12 @@ typedef struct {
   bool is_weekly;
 } RowSpec;
 
+// One row per data slot, in on-screen order — back to the original 1:1
+// mapping. Claude's rows have no pushed percentage any more (see
+// advance_claude_reset/update_rows below): their bar/number instead show how
+// much of the current window has *elapsed*, derived from the reset countdown.
 static const RowSpec ROWS[ROW_COUNT] = {
-  { "CL 5H", true,  false },
+  { "GHD", false, false },
   { "CL 7D", true,  true  },
   { "MM 5H", false, false },
   { "MM 7D", false, true  },
@@ -38,8 +42,16 @@ static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
 #define PERSIST_TARGET     301
 #define PERSIST_THEME      310
 #define PERSIST_TIME_FONT  311
+#define PERSIST_AI_PROVIDER 312
 #define PERSIST_ALERTED(i) (400 + (i))
 #define PERSIST_RESET_ALERTED(i) (450 + (i))
+#define PERSIST_CODEX_PCT(i) (500 + (i) * 2)
+#define PERSIST_CODEX_RESET(i) (500 + (i) * 2 + 1)
+#define PERSIST_CODEX_ALERTED(i) (520 + (i))
+#define PERSIST_CODEX_RESET_ALERTED(i) (530 + (i))
+#define PERSIST_GITHUB_COMMITS 540
+#define PERSIST_GITHUB_SYNC    541
+#define PERSIST_GITHUB_LATEST  542
 
 // Buzz once when a quota first crosses this. Persisted per row so a restart
 // doesn't re-alert, and cleared when the window resets so the next crossing
@@ -54,8 +66,23 @@ static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
 // the numbers behind them are no longer trustworthy.
 #define STALE_AFTER_SEC (20 * 60)
 
+// Claude's two windows (rows 0 and 1) have no live quota fetch at all — the
+// phone just calibrates a reset time once, and the firmware itself rolls the
+// countdown over to the next window when one expires. That is what makes
+// these two immune to the "phone/network went stale" problem entirely.
+#define CLAUDE_5H_PERIOD_SEC (5 * 60 * 60)
+#define CLAUDE_WK_PERIOD_SEC (7 * 24 * 60 * 60)
+
+// Claude's percentage is elapsed window time, not used quota — a violet that
+// doesn't collide with the orange row label, the blue MiniMax rows, or the
+// grey/red states a real usage number can be in, so it reads as its own kind
+// of thing at a glance instead of looking like a mislabeled quota.
+#define CLAUDE_ELAPSED_COLOR GColorVividViolet
+
 static int32_t s_pct[ROW_COUNT];     // -1 = no data yet
 static int32_t s_reset[ROW_COUNT];   // absolute UTC epoch seconds of next reset
+static int32_t s_codex_pct[2];       // manually calibrated Codex 5h / 7d usage
+static int32_t s_codex_reset[2];     // Codex reset timestamps, kept across display switches
 static int32_t s_temp[WX_COUNT];     // NO_TEMP = no data yet
 static int32_t s_code[WX_COUNT];     // WMO weather code
 // UTC epoch of the last quota push per provider (0 = claude, 1 = minimax), 0 =
@@ -67,12 +94,18 @@ static bool s_refresh_pending;       // a refresh was asked for and hasn't lande
 static int32_t s_target_date;        // local midnight of the countdown target, 0 = unset
 static bool s_alerted[ROW_COUNT];    // this row has already buzzed for its current window
 static bool s_reset_alerted[ROW_COUNT]; // this weekly row has already buzzed for its upcoming reset
+static bool s_codex_alerted[2];
+static bool s_codex_reset_alerted[2];
+static int32_t s_github_commits;      // commits authored today, -1 = no data
+static int32_t s_github_sync;         // UTC epoch of last successful GitHub fetch
+static int32_t s_github_latest;       // UTC epoch of the most recent visible commit
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
 // looks right even before the first AppMessage lands.
 static int32_t s_theme;              // 0 = light, 1 = dark
 static int32_t s_time_font;          // 0 = bitham, 1 = consolas
+static int32_t s_ai_provider;        // 0 = Claude, 1 = ChatGPT Codex
 
 // Every colour on screen comes from one of these two palettes, so the whole
 // face flips with a single value. Accent is the warm "attention" colour (sun,
@@ -119,7 +152,7 @@ static GFont s_consolas_font;          // loaded at window_load, freed at unload
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
-static TextLayer *s_ampm_layer;
+static TextLayer *s_birthday_layer;
 static TextLayer *s_dday_layer;
 static TextLayer *s_wx_label_layers[WX_COUNT];
 static TextLayer *s_wx_temp_layers[WX_COUNT];
@@ -134,11 +167,11 @@ static TextLayer *s_reset_layers[ROW_COUNT];
 static char s_time_buf[8];
 static char s_date_buf[16];
 static char s_countdown_buf[10];
-static char s_ampm_buf[6];
+static char s_birthday_buf[12];
 static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
-static char s_pct_buf[ROW_COUNT][8];
-static char s_reset_buf[ROW_COUNT][10];
+static char s_pct_buf[ROW_COUNT][12];
+static char s_reset_buf[ROW_COUNT][12];
 
 // ------------------------------------------------------------------- layout
 
@@ -156,9 +189,9 @@ static char s_reset_buf[ROW_COUNT][10];
 #define BATT_H        10
 #define BT_X          130
 #define BT_Y          2
-#define AMPM_X        2
-#define AMPM_Y        17
-#define AMPM_W        24
+#define BIRTHDAY_X    2
+#define BIRTHDAY_Y    17
+#define BIRTHDAY_W    24
 #define DDAY_X        119
 #define DDAY_Y        17
 #define DDAY_W        22
@@ -192,7 +225,7 @@ static char s_reset_buf[ROW_COUNT][10];
 // baseline lands exactly on it and every label reads as struck through.
 #define ROWS_Y        100
 #define ROW_H         17
-#define BAR_H         2
+#define BAR_H         4
 #define TEXT_DY       (-1)
 #define PCT_DY        (-4)
 #define R_LABEL_X     3
@@ -344,10 +377,6 @@ static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
   }
 }
 
-static GColor row_color(int i) {
-  return ROWS[i].is_claude ? GColorOrange : GColorPictonBlue;
-}
-
 // ---------------------------------------------------------------- formatting
 
 // Remaining time until reset, kept as short as possible so the font can stay big.
@@ -372,29 +401,122 @@ static bool data_is_stale(time_t now, int provider) {
   return last <= 0 || (int32_t)now - last > STALE_AFTER_SEC;
 }
 
-static void update_rows(time_t now) {
+// Rows 0/1 (CL 5H, CL 7D) are calibrated once and never re-synced, so nothing
+// else will ever push them forward once they hit zero — do it here instead,
+// every minute, so the countdown always reflects "time left in the *current*
+// window" rather than freezing at "now" forever after the first expiry.
+static void advance_claude_reset(time_t now) {
   for (int i = 0; i < ROW_COUNT; i++) {
-    bool stale = data_is_stale(now, ROWS[i].is_claude ? 0 : 1);
+    if (!ROWS[i].is_claude || s_reset[i] <= 0) continue;
+    int32_t period = ROWS[i].is_weekly ? CLAUDE_WK_PERIOD_SEC : CLAUDE_5H_PERIOD_SEC;
+    bool changed = false;
+    while (s_reset[i] <= (int32_t)now) {
+      s_reset[i] += period;
+      changed = true;
+    }
+    if (changed) persist_write_int(PERSIST_RESET(i), s_reset[i]);
+  }
 
-    if (s_pct[i] < 0) {
+  for (int i = 0; i < 2; i++) {
+    if (s_codex_reset[i] <= 0) continue;
+    int32_t period = i == 1 ? CLAUDE_WK_PERIOD_SEC : CLAUDE_5H_PERIOD_SEC;
+    bool changed = false;
+    while (s_codex_reset[i] <= (int32_t)now) {
+      s_codex_reset[i] += period;
+      changed = true;
+    }
+    if (changed) {
+      s_codex_pct[i] = 0;
+      persist_write_int(PERSIST_CODEX_PCT(i), 0);
+      persist_write_int(PERSIST_CODEX_RESET(i), s_codex_reset[i]);
+    }
+  }
+}
+
+// Claude has no pushed usage percentage — instead, how much of the current
+// window has *elapsed* since the last reset, as a 0-100 bar fill. Derived
+// straight from the reset countdown, so it needs no separate "window start"
+// bookkeeping: elapsed = period - remaining.
+static int32_t claude_elapsed_pct(int i, time_t now) {
+  if (s_reset[i] <= 0) return -1;
+  int32_t period = ROWS[i].is_weekly ? CLAUDE_WK_PERIOD_SEC : CLAUDE_5H_PERIOD_SEC;
+  int32_t remaining = s_reset[i] - (int32_t)now;
+  int32_t elapsed = period - remaining;
+  if (elapsed < 0) elapsed = 0;
+  if (elapsed > period) elapsed = period;
+  return (elapsed * 100) / period;
+}
+
+static int32_t active_pct(int i, time_t now) {
+  if (i >= 2) return s_pct[i];
+  return s_ai_provider ? s_codex_pct[i] : claude_elapsed_pct(i, now);
+}
+
+static int32_t active_reset(int i) {
+  return i < 2 && s_ai_provider ? s_codex_reset[i] : s_reset[i];
+}
+
+static void update_provider_labels(void) {
+  text_layer_set_text(s_label_layers[0], "GHD");
+  text_layer_set_text(s_label_layers[1], s_ai_provider ? "CX 7D" : "CL 7D");
+}
+
+static void update_rows(time_t now) {
+  update_provider_labels();
+  for (int i = 0; i < ROW_COUNT; i++) {
+    if (i == 0) {
+      bool stale = s_github_sync <= 0 ||
+                   (int32_t)now - s_github_sync > STALE_AFTER_SEC;
+      if (s_github_commits < 0) {
+        snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "--");
+      } else {
+        snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "%ld", (long)s_github_commits);
+      }
+      text_layer_set_text_color(s_pct_layers[i],
+                                stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
+      text_layer_set_text(s_pct_layers[i], s_pct_buf[i]);
+      if (s_github_latest <= 0) {
+        snprintf(s_reset_buf[i], sizeof(s_reset_buf[i]), "--");
+      } else {
+        time_t latest_time = (time_t)s_github_latest;
+        struct tm latest = *localtime(&latest_time);
+        struct tm today = *localtime(&now);
+        const char *format = latest.tm_year == today.tm_year &&
+                             latest.tm_yday == today.tm_yday ? "%H:%M" : "%m-%d";
+        strftime(s_reset_buf[i], sizeof(s_reset_buf[i]), format, &latest);
+      }
+      text_layer_set_text(s_reset_layers[i], s_reset_buf[i]);
+      continue;
+    }
+    bool is_claude = i < 2 && !s_ai_provider;
+    int32_t p = active_pct(i, now);
+    bool stale = (i >= 2 && data_is_stale(now, 1)) ||
+                 (i < 2 && s_ai_provider && data_is_stale(now, 0));
+
+    if (p < 0) {
       snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "--");
       // The placeholder is the same dark grey in both themes.
       text_layer_set_text_color(s_pct_layers[i], GColorDarkGray);
     } else {
-      int32_t p = s_pct[i];
       if (p > 100) p = 100;
       snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "%ld%%", (long)p);
-      // Grey means "this number may have moved since we last heard from the phone".
+      // Claude's number is a different kind of thing from MiniMax's — elapsed
+      // window time, not used quota — so it gets its own colour throughout,
+      // never the grey/red that mean "stale" or "running low" for a real
+      // usage percentage. Grey doesn't apply here anyway (computed fresh every
+      // redraw), and high-elapsed just means "about to reset", not a warning.
       text_layer_set_text_color(s_pct_layers[i],
-                                stale ? THEMES[s_theme].stale
-                                      : (p >= 90 ? GColorRed : THEMES[s_theme].fg));
+                                is_claude ? CLAUDE_ELAPSED_COLOR
+                                : (stale ? THEMES[s_theme].stale
+                                         : (p >= 90 ? GColorRed : THEMES[s_theme].fg)));
     }
     text_layer_set_text(s_pct_layers[i], s_pct_buf[i]);
 
-    if (s_reset[i] <= 0) {
+    int32_t reset = active_reset(i);
+    if (reset <= 0) {
       snprintf(s_reset_buf[i], sizeof(s_reset_buf[i]), "--");
     } else {
-      fmt_remaining(s_reset_buf[i], sizeof(s_reset_buf[i]), s_reset[i] - (int32_t)now);
+      fmt_remaining(s_reset_buf[i], sizeof(s_reset_buf[i]), reset - (int32_t)now);
     }
     text_layer_set_text(s_reset_layers[i], s_reset_buf[i]);
   }
@@ -449,6 +571,29 @@ static void update_dday(time_t now) {
   text_layer_set_text(s_dday_layer, s_dday_buf);
 }
 
+// Whole local-calendar days until the next March 28. The birthday itself is
+// day zero; after it passes, the target advances to the following year.
+static void update_birthday(time_t now) {
+  time_t today_midnight = local_midnight(now);
+  struct tm birthday = *localtime(&now);
+  birthday.tm_mon = 2;  // struct tm months are zero-based
+  birthday.tm_mday = 28;
+  birthday.tm_hour = 0;
+  birthday.tm_min = 0;
+  birthday.tm_sec = 0;
+  time_t target = mktime(&birthday);
+  if (target < today_midnight) {
+    birthday.tm_year++;
+    target = mktime(&birthday);
+  }
+  int days = (int)((target - today_midnight + 43200) / 86400);
+  snprintf(s_birthday_buf, sizeof(s_birthday_buf), "%d", days);
+#ifdef WIDEST_CLOCK
+  snprintf(s_birthday_buf, sizeof(s_birthday_buf), "365");
+#endif
+  text_layer_set_text(s_birthday_layer, s_birthday_buf);
+}
+
 static void update_clock(struct tm *t) {
   strftime(s_time_buf, sizeof(s_time_buf),
            clock_is_24h_style() ? "%H:%M" : "%I:%M", t);
@@ -462,17 +607,6 @@ static void update_clock(struct tm *t) {
 #endif
   text_layer_set_text(s_time_layer, s_time_buf);
 
-  // Nothing to disambiguate on a 24h clock, so the corner stays empty there.
-  if (clock_is_24h_style()) {
-    s_ampm_buf[0] = '\0';
-  } else {
-    strftime(s_ampm_buf, sizeof(s_ampm_buf), "%p", t);
-  }
-#ifdef WIDEST_CLOCK
-  snprintf(s_ampm_buf, sizeof(s_ampm_buf), "PM");
-#endif
-  text_layer_set_text(s_ampm_layer, s_ampm_buf);
-
   strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
   text_layer_set_text(s_date_layer, s_date_buf);
 }
@@ -483,11 +617,19 @@ static void update_ui(void) {
   update_clock(t);
   update_countdown(t);
   update_dday(now);
+  update_birthday(now);
   update_weather();
+  advance_claude_reset(now);
   update_rows(now);
 }
 
 // -------------------------------------------------------------------- render
+
+static GColor row_color(int i) {
+  if (i == 0) return GColorJaegerGreen;
+  if (i >= 2) return GColorPictonBlue;
+  return s_ai_provider ? GColorGreen : GColorOrange;
+}
 
 static void rows_update_proc(Layer *layer, GContext *ctx) {
   // The gauge starts after the label rather than at the screen edge. Run it the
@@ -496,18 +638,22 @@ static void rows_update_proc(Layer *layer, GContext *ctx) {
   // with the number it is describing.
   int bar_x = R_LABEL_X + R_LABEL_W;
   int bar_w = SCREEN_W - R_LABEL_X - bar_x;
+  time_t now = time(NULL);
 
   for (int i = 0; i < ROW_COUNT; i++) {
+    if (i == 0) continue;
+    bool is_claude = i < 2 && !s_ai_provider;
     int y = i * ROW_H + ROW_H - BAR_H;
+    int32_t p = active_pct(i, now);
 
     graphics_context_set_fill_color(ctx, THEMES[s_theme].gauge_track);
     graphics_fill_rect(ctx, GRect(bar_x, y, bar_w, BAR_H), 0, GCornerNone);
 
-    if (s_pct[i] >= 0) {
-      int32_t p = s_pct[i] > 100 ? 100 : s_pct[i];
-      // The bar turns red with the number, so the alarm reads even if your eye
-      // never reaches the digits.
-      graphics_context_set_fill_color(ctx, p >= 90 ? GColorRed : row_color(i));
+    if (p >= 0) {
+      if (p > 100) p = 100;
+      // Red is a MiniMax-only "running low" warning — for Claude, a full bar
+      // just means "about to reset", so it stays the row colour throughout.
+      graphics_context_set_fill_color(ctx, (!is_claude && p >= 90) ? GColorRed : row_color(i));
       graphics_fill_rect(ctx, GRect(bar_x, y, (bar_w * (int)p) / 100, BAR_H), 0, GCornerNone);
     }
   }
@@ -600,7 +746,7 @@ static void apply_theme(void) {
 
   text_layer_set_text_color(s_date_layer, t->fg_dim);
   text_layer_set_text_color(s_countdown_layer, t->accent);
-  text_layer_set_text_color(s_ampm_layer, t->fg_dim);
+  text_layer_set_text_color(s_birthday_layer, t->fg_dim);
   text_layer_set_text_color(s_dday_layer, t->fg);
 
   for (int i = 0; i < WX_COUNT; i++) {
@@ -637,6 +783,21 @@ static void apply_quota(DictionaryIterator *it, uint32_t pct_key, uint32_t reset
   if (r) store_int(PERSIST_RESET(idx), &s_reset[idx], r->value->int32);
 }
 
+// Claude's two rows only ever get a reset time (calibration), never a
+// percentage — there is no MESSAGE_KEY_CLAUDE_*_PCT any more.
+static void apply_reset_only(DictionaryIterator *it, uint32_t reset_key, int idx) {
+  Tuple *r = dict_find(it, reset_key);
+  if (r) store_int(PERSIST_RESET(idx), &s_reset[idx], r->value->int32);
+}
+
+static void apply_codex_quota(DictionaryIterator *it, uint32_t pct_key,
+                              uint32_t reset_key, int idx) {
+  Tuple *p = dict_find(it, pct_key);
+  Tuple *r = dict_find(it, reset_key);
+  if (p) store_int(PERSIST_CODEX_PCT(idx), &s_codex_pct[idx], p->value->int32);
+  if (r) store_int(PERSIST_CODEX_RESET(idx), &s_codex_reset[idx], r->value->int32);
+}
+
 static void apply_weather(DictionaryIterator *it, uint32_t temp_key, uint32_t code_key, int idx) {
   Tuple *t = dict_find(it, temp_key);
   Tuple *c = dict_find(it, code_key);
@@ -664,12 +825,17 @@ static void check_quota_alerts(void) {
   bool crossed = false;
 
   for (int i = 0; i < ROW_COUNT; i++) {
-    if (s_pct[i] < 0) continue;
-    bool over = s_pct[i] >= ALERT_PCT;
-    if (over == s_alerted[i]) continue;
+    if (i == 0) continue;
+    if (i < 2 && !s_ai_provider) continue;
+    int32_t pct = i < 2 ? s_codex_pct[i] : s_pct[i];
+    bool *alerted = i < 2 ? &s_codex_alerted[i] : &s_alerted[i];
+    uint32_t key = i < 2 ? PERSIST_CODEX_ALERTED(i) : PERSIST_ALERTED(i);
+    if (pct < 0) continue;
+    bool over = pct >= ALERT_PCT;
+    if (over == *alerted) continue;
     if (over) crossed = true;
-    s_alerted[i] = over;
-    persist_write_bool(PERSIST_ALERTED(i), over);
+    *alerted = over;
+    persist_write_bool(key, over);
   }
 
   // One buzz even if several rows cross in the same push. Quiet time is the
@@ -687,23 +853,42 @@ static void check_reset_alerts(time_t now) {
   bool crossed = false;
 
   for (int i = 0; i < ROW_COUNT; i++) {
-    if (!ROWS[i].is_weekly || s_reset[i] <= 0) continue;
-    int32_t remaining = s_reset[i] - (int32_t)now;
+    if (!ROWS[i].is_weekly) continue;
+    int32_t reset = active_reset(i);
+    if (reset <= 0) continue;
+    bool *alerted = i < 2 && s_ai_provider ? &s_codex_reset_alerted[i]
+                                           : &s_reset_alerted[i];
+    uint32_t key = i < 2 && s_ai_provider ? PERSIST_CODEX_RESET_ALERTED(i)
+                                          : PERSIST_RESET_ALERTED(i);
+    int32_t remaining = reset - (int32_t)now;
     bool within = remaining > 0 && remaining <= RESET_ALERT_SEC;
-    if (within == s_reset_alerted[i]) continue;
+    if (within == *alerted) continue;
     if (within) crossed = true;
-    s_reset_alerted[i] = within;
-    persist_write_bool(PERSIST_RESET_ALERTED(i), within);
+    *alerted = within;
+    persist_write_bool(key, within);
   }
 
   if (crossed && !quiet_time_is_active()) vibes_long_pulse();
 }
 
 static void inbox_received(DictionaryIterator *it, void *context) {
-  apply_quota(it, MESSAGE_KEY_CLAUDE_5H_PCT,  MESSAGE_KEY_CLAUDE_5H_RESET,  0);
-  apply_quota(it, MESSAGE_KEY_CLAUDE_WK_PCT,  MESSAGE_KEY_CLAUDE_WK_RESET,  1);
+  apply_reset_only(it, MESSAGE_KEY_CLAUDE_5H_RESET, 0);
+  apply_reset_only(it, MESSAGE_KEY_CLAUDE_WK_RESET, 1);
+  apply_codex_quota(it, MESSAGE_KEY_CODEX_5H_PCT, MESSAGE_KEY_CODEX_5H_RESET, 0);
+  apply_codex_quota(it, MESSAGE_KEY_CODEX_WK_PCT, MESSAGE_KEY_CODEX_WK_RESET, 1);
   apply_quota(it, MESSAGE_KEY_MINIMAX_5H_PCT, MESSAGE_KEY_MINIMAX_5H_RESET, 2);
   apply_quota(it, MESSAGE_KEY_MINIMAX_WK_PCT, MESSAGE_KEY_MINIMAX_WK_RESET, 3);
+
+  Tuple *github = dict_find(it, MESSAGE_KEY_GITHUB_TODAY_COMMITS);
+  if (github) {
+    store_int(PERSIST_GITHUB_COMMITS, &s_github_commits, github->value->int32);
+    store_int(PERSIST_GITHUB_SYNC, &s_github_sync, (int32_t)time(NULL));
+  }
+  Tuple *github_latest = dict_find(it, MESSAGE_KEY_GITHUB_LATEST_COMMIT_AT);
+  if (github_latest) {
+    store_int(PERSIST_GITHUB_LATEST, &s_github_latest,
+              github_latest->value->int32);
+  }
 
   apply_weather(it, MESSAGE_KEY_WX_TEMP_NOW, MESSAGE_KEY_WX_CODE_NOW, 0);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_6H,  MESSAGE_KEY_WX_CODE_6H,  1);
@@ -717,12 +902,17 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   if (theme) store_int(PERSIST_THEME, &s_theme, theme->value->int32);
   Tuple *time_font = dict_find(it, MESSAGE_KEY_TIME_FONT);
   if (time_font) store_int(PERSIST_TIME_FONT, &s_time_font, time_font->value->int32);
+  Tuple *provider = dict_find(it, MESSAGE_KEY_AI_PROVIDER);
+  if (provider) {
+    int32_t value = provider->value->int32 ? 1 : 0;
+    store_int(PERSIST_AI_PROVIDER, &s_ai_provider, value);
+  }
 
   // Only a quota push counts as a sync — a weather-only message says nothing
-  // about how fresh the percentages are. Tracked per provider: MiniMax landing
-  // fine must not paper over Claude silently failing to push, or vice versa.
+  // about how fresh the percentages are. Claude does not sync live, while
+  // Codex and MiniMax are tracked independently.
   time_t now = time(NULL);
-  if (dict_find(it, MESSAGE_KEY_CLAUDE_5H_PCT) || dict_find(it, MESSAGE_KEY_CLAUDE_WK_PCT)) {
+  if (dict_find(it, MESSAGE_KEY_CODEX_5H_PCT) || dict_find(it, MESSAGE_KEY_CODEX_WK_PCT)) {
     store_int(PERSIST_LAST_SYNC(0), &s_last_sync[0], (int32_t)now);
   }
   if (dict_find(it, MESSAGE_KEY_MINIMAX_5H_PCT) || dict_find(it, MESSAGE_KEY_MINIMAX_WK_PCT)) {
@@ -746,6 +936,12 @@ static void load_persisted(void) {
     s_pct[i]   = persist_exists(PERSIST_PCT(i))   ? persist_read_int(PERSIST_PCT(i))   : -1;
     s_reset[i] = persist_exists(PERSIST_RESET(i)) ? persist_read_int(PERSIST_RESET(i)) : 0;
   }
+  for (int i = 0; i < 2; i++) {
+    s_codex_pct[i] = persist_exists(PERSIST_CODEX_PCT(i))
+                       ? persist_read_int(PERSIST_CODEX_PCT(i)) : -1;
+    s_codex_reset[i] = persist_exists(PERSIST_CODEX_RESET(i))
+                         ? persist_read_int(PERSIST_CODEX_RESET(i)) : 0;
+  }
   for (int i = 0; i < WX_COUNT; i++) {
     s_temp[i] = persist_exists(PERSIST_TEMP(i)) ? persist_read_int(PERSIST_TEMP(i)) : NO_TEMP;
     s_code[i] = persist_exists(PERSIST_CODE(i)) ? persist_read_int(PERSIST_CODE(i)) : -1;
@@ -756,10 +952,24 @@ static void load_persisted(void) {
   s_target_date = persist_exists(PERSIST_TARGET) ? persist_read_int(PERSIST_TARGET) : 0;
   s_theme = persist_exists(PERSIST_THEME) ? persist_read_int(PERSIST_THEME) : 0;
   s_time_font = persist_exists(PERSIST_TIME_FONT) ? persist_read_int(PERSIST_TIME_FONT) : 0;
+  s_ai_provider = persist_exists(PERSIST_AI_PROVIDER)
+                    ? (persist_read_int(PERSIST_AI_PROVIDER) ? 1 : 0) : 0;
+  s_github_commits = persist_exists(PERSIST_GITHUB_COMMITS)
+                       ? persist_read_int(PERSIST_GITHUB_COMMITS) : -1;
+  s_github_sync = persist_exists(PERSIST_GITHUB_SYNC)
+                    ? persist_read_int(PERSIST_GITHUB_SYNC) : 0;
+  s_github_latest = persist_exists(PERSIST_GITHUB_LATEST)
+                      ? persist_read_int(PERSIST_GITHUB_LATEST) : 0;
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
     s_reset_alerted[i] = persist_exists(PERSIST_RESET_ALERTED(i)) &&
                           persist_read_bool(PERSIST_RESET_ALERTED(i));
+  }
+  for (int i = 0; i < 2; i++) {
+    s_codex_alerted[i] = persist_exists(PERSIST_CODEX_ALERTED(i)) &&
+                          persist_read_bool(PERSIST_CODEX_ALERTED(i));
+    s_codex_reset_alerted[i] = persist_exists(PERSIST_CODEX_RESET_ALERTED(i)) &&
+                                persist_read_bool(PERSIST_CODEX_RESET_ALERTED(i));
   }
 }
 
@@ -801,10 +1011,12 @@ static void window_load(Window *window) {
   layer_set_update_proc(s_status_layer, status_update_proc);
   layer_add_child(root, s_status_layer);
 
-  s_ampm_layer = make_text(root, GRect(AMPM_X, AMPM_Y, AMPM_W, CORNER_H),
-                           fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
-                           GTextAlignmentLeft, THEMES[s_theme].fg_dim);
-  text_layer_set_text(s_ampm_layer, "");
+  // Days until the next March 28, replacing the old AM/PM indicator.
+  s_birthday_layer = make_text(root,
+                               GRect(BIRTHDAY_X, BIRTHDAY_Y, BIRTHDAY_W, CORNER_H),
+                               fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                               GTextAlignmentLeft, THEMES[s_theme].fg_dim);
+  text_layer_set_text(s_birthday_layer, "");
 
   // Just the number, per the brief — the target date lives in the phone's
   // settings page and is the only place it needs spelling out.
@@ -883,7 +1095,7 @@ static void window_unload(Window *window) {
   text_layer_destroy(s_separators[0]);
   text_layer_destroy(s_separators[1]);
   text_layer_destroy(s_dday_layer);
-  text_layer_destroy(s_ampm_layer);
+  text_layer_destroy(s_birthday_layer);
   text_layer_destroy(s_countdown_layer);
   text_layer_destroy(s_date_layer);
   text_layer_destroy(s_time_layer);
@@ -892,14 +1104,18 @@ static void window_unload(Window *window) {
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   update_clock(tick_time);
   update_countdown(tick_time);
-  update_dday(time(NULL));
-  update_rows(time(NULL));
-
-  // Nudge the phone as soon as either provider's data would otherwise go grey,
-  // so a watchface left on the wrist keeps itself current without waiting for
-  // the JS interval.
   time_t n = time(NULL);
-  if (data_is_stale(n, 0) || data_is_stale(n, 1)) request_refresh();
+  update_dday(n);
+  update_birthday(n);
+  advance_claude_reset(n);
+  update_rows(n);
+
+  // Nudge the phone as soon as a displayed live provider would otherwise go
+  // grey. Claude is locally derived and therefore excluded.
+  if (data_is_stale(n, 1) || (s_ai_provider && data_is_stale(n, 0)) ||
+      s_github_sync <= 0 || (int32_t)n - s_github_sync > STALE_AFTER_SEC) {
+    request_refresh();
+  }
 
   check_reset_alerts(n);
 }
@@ -907,6 +1123,25 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 // Flick of the wrist forces an immediate fetch.
 static void tap_handler(AccelAxisType axis, int32_t direction) {
   request_refresh();
+}
+
+// The select button switches the 7D row between Claude and Codex. GitHub stays
+// fixed in row 0; both AI providers keep independent persisted 7D data.
+static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  s_ai_provider = s_ai_provider ? 0 : 1;
+  persist_write_int(PERSIST_AI_PROVIDER, s_ai_provider);
+  apply_theme();
+  update_ui();
+
+  if (!connection_service_peek_pebble_app_connection()) return;
+  DictionaryIterator *out;
+  if (app_message_outbox_begin(&out) != APP_MSG_OK) return;
+  dict_write_uint8(out, MESSAGE_KEY_AI_PROVIDER, (uint8_t)s_ai_provider);
+  app_message_outbox_send();
+}
+
+static void click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
 }
 
 // Coming back into range is the moment a refresh is most likely to succeed.
@@ -923,8 +1158,13 @@ static void init(void) {
   load_persisted();
 #ifdef DEMO_DATA
   time_t n = time(NULL);
-  s_pct[0] = 87;  s_reset[0] = n + 2 * 3600 + 13 * 60;
-  s_pct[1] = 42;  s_reset[1] = n + 4 * 86400 + 5 * 3600;
+  // s_pct[0]/[1] (Claude) are intentionally left at -1 — the bar/number for
+  // those two rows is computed from s_reset via claude_elapsed_pct(), not
+  // pushed data.
+  s_reset[0] = n + 2 * 3600 + 13 * 60;
+  s_reset[1] = n + 4 * 86400 + 5 * 3600;
+  s_codex_pct[0] = 24; s_codex_reset[0] = n + 3 * 3600;
+  s_codex_pct[1] = 61; s_codex_reset[1] = n + 2 * 86400;
   s_pct[2] = 100; s_reset[2] = n + 47 * 60;
   s_pct[3] = 6;   s_reset[3] = n + 6 * 86400;
   // Codes chosen to exercise three different icon shapes at once; change them
@@ -935,6 +1175,7 @@ static void init(void) {
 #endif
 
   s_window = window_create();
+  window_set_click_config_provider(s_window, click_config_provider);
   window_set_window_handlers(s_window, (WindowHandlers) {
     .load = window_load,
     .unload = window_unload

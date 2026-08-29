@@ -2,19 +2,20 @@
  * Phone-side companion. The watch has no network of its own, so this fetches
  * everything and pushes it over AppMessage:
  *
- *   - Claude quota, straight from api.anthropic.com using OAuth tokens baked in
- *     by tools/make_secrets.py. The phone refreshes the token itself.
+ *   - Today's public GitHub commit count, fetched directly from GitHub.
+ *   - Claude's 5h/7d usage windows are NOT fetched live any more — every live
+ *     approach (direct OAuth refresh, the PC collector) kept going stale
+ *     because Claude's refresh token rotates on use and collides with
+ *     whichever other holder (Claude Code CLI, this phone) refreshed it last.
+ *     Instead the watch just counts down two windows locally: you tell it how
+ *     much time is left in each (settings page), it stores the resulting
+ *     reset time, and the firmware itself rolls the countdown to the next
+ *     window once one expires (see advance_claude_reset in main.c). No token,
+ *     no network call, nothing to go stale.
+ *   - ChatGPT Codex quota from the phone's own device-code login. Access tokens
+ *     are refreshed on the phone; manual calibration remains as a fallback.
  *   - MiniMax quota, straight from api.minimaxi.com with the coding-plan key.
  *   - Weather for now / +6h / +24h, from Open-Meteo (free, no API key).
- *
- * Nothing here needs the PC collector. tools/quota_collector.py still works and
- * still wins if you point DEFAULTS.url at it — see refreshQuotas below.
- *
- * On Claude's refresh token: it ROTATES. The moment this code refreshes, the
- * copy in ~/.claude/.credentials.json on the PC is dead and Claude Code there
- * will ask you to log in again. That is the accepted trade for having the watch
- * work away from the PC. After any such re-login, re-run make_secrets.py and
- * reinstall to re-seed the phone.
  */
 
 // Substituted by tools/make_secrets.py, which renders this template into
@@ -26,23 +27,25 @@ var SECRETS = /*__SECRETS__*/{};
 // First line of output in `pebble logs`. If you don't see it, the JS never
 // loaded at all — which looks identical to "the gear icon does nothing", since
 // an unloaded pkjs registers no showConfiguration listener either.
-console.log('pkjs boot: claude=' + (SECRETS.claudeRefreshToken ? 'yes' : 'NO') +
-            ' minimax=' + (SECRETS.minimaxKey ? 'yes' : 'NO'));
+console.log('pkjs boot: codex=' + (localStorage.getItem('codex_oauth') ? 'yes' : 'NO') +
+            ' minimax=' + (SECRETS.minimaxKey ? 'yes' : 'NO') +
+            ' github=' + (SECRETS.githubUsername || 'LinBlink'));
 
 // ---------------------------------------------------------------- defaults
 //
 // Everything the watchface needs is baked in here, so it works with no settings
 // page at all. Anything saved through the settings page overrides these.
 var DEFAULTS = {
-  url: '',            // optional PC collector, e.g. 'https://x.trycloudflare.com/quota.json'
-  token: '',          // optional bearer token for that endpoint
   refreshMin: 5,
   units: 'celsius',   // or 'fahrenheit'
   lat: '',            // blank = use phone GPS
   lon: '',
   targetDate: '',     // 'YYYY-MM-DD' for the day counter; blank hides it
   theme: 'light',     // or 'dark'
-  timeFont: 'bitham'  // or 'consolas' — Consolas-like digits for the clock
+  timeFont: 'bitham', // or 'consolas' — Consolas-like digits for the clock
+  aiProvider: 'claude', // select button toggles the Claude / Codex 7D row
+  githubUsername: SECRETS.githubUsername || 'LinBlink',
+  githubToken: SECRETS.githubToken || ''
 };
 
 var DEFAULT_QUOTA_REFRESH_MIN = 5;
@@ -51,27 +54,24 @@ var WEATHER_REFRESH_MIN = 30;
 // wrist can't hammer the endpoints.
 var MIN_REFRESH_GAP_MS = 20 * 1000;
 
-// Claude Code's own OAuth client. The token endpoint moved to platform.claude.com;
-// console.anthropic.com still answers, so try both before giving up.
-var CLAUDE_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-var CLAUDE_TOKEN_URLS = [
-  'https://platform.claude.com/v1/oauth/token',
-  'https://console.anthropic.com/v1/oauth/token'
-];
-var CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 var MINIMAX_USAGE_URL = 'https://api.minimaxi.com/v1/token_plan/remains';
-
-// Refresh a bit before the token actually dies, so a slow request can't land
-// on the far side of the expiry.
-var TOKEN_EARLY_REFRESH_MS = 5 * 60 * 1000;
+// Codex's device login and personal quota endpoints are used by the Codex
+// client but are not part of the documented public OpenAI API. Keep every URL
+// in one place so a server-side change has a small, obvious repair surface.
+var CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+var CODEX_DEVICE_CODE_URL = 'https://auth.openai.com/api/accounts/deviceauth/usercode';
+var CODEX_DEVICE_POLL_URL = 'https://auth.openai.com/api/accounts/deviceauth/token';
+var CODEX_DEVICE_LOGIN_URL = 'https://auth.openai.com/codex/device';
+var CODEX_TOKEN_URL = 'https://auth.openai.com/oauth/token';
+var CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
+var CODEX_TOKEN_EARLY_REFRESH_MS = 5 * 60 * 1000;
+var CODEX_BACKOFF_MS = 15 * 60 * 1000;
 
 var lastQuotaFetch = 0;
-
-// The usage endpoint rate-limits, and the watch can ask for a refresh on every
-// wrist flick and reconnect. Without a backoff those requests keep the limit
-// alive; MiniMax and weather carry on regardless.
-var CLAUDE_BACKOFF_MS = 15 * 60 * 1000;
-var claudeBackoffUntil = 0;
+var codexBackoffUntil = 0;
+var codexRefreshInFlight = false;
+var codexRefreshWaiters = [];
+var codexLoginTimer = null;
 
 function getSettings() {
   var raw = localStorage.getItem('settings');
@@ -83,15 +83,16 @@ function getSettings() {
   var theme = s.theme || DEFAULTS.theme;
   var timeFont = s.timeFont || DEFAULTS.timeFont;
   return {
-    url: s.url || DEFAULTS.url,
-    token: s.token || DEFAULTS.token,
     refreshMin: s.refreshMin || DEFAULTS.refreshMin || DEFAULT_QUOTA_REFRESH_MIN,
     units: units === 'fahrenheit' ? 'fahrenheit' : 'celsius',
     lat: s.lat || DEFAULTS.lat,
     lon: s.lon || DEFAULTS.lon,
     targetDate: s.targetDate || DEFAULTS.targetDate,
     theme: theme === 'dark' ? 'dark' : 'light',
-    timeFont: timeFont === 'consolas' ? 'consolas' : 'bitham'
+    timeFont: timeFont === 'consolas' ? 'consolas' : 'bitham',
+    aiProvider: s.aiProvider === 'codex' ? 'codex' : 'claude',
+    githubUsername: s.githubUsername || DEFAULTS.githubUsername,
+    githubToken: s.githubToken || DEFAULTS.githubToken
   };
 }
 
@@ -115,7 +116,8 @@ function sendAppearance() {
   var cfg = getSettings();
   send({
     THEME: cfg.theme === 'dark' ? 1 : 0,
-    TIME_FONT: cfg.timeFont === 'consolas' ? 1 : 0
+    TIME_FONT: cfg.timeFont === 'consolas' ? 1 : 0,
+    AI_PROVIDER: cfg.aiProvider === 'codex' ? 1 : 0
   });
 }
 
@@ -140,7 +142,9 @@ function request(method, url, headers, body, onOk, onFail) {
     if (req.status < 200 || req.status >= 300) {
       console.log(url.split('?')[0] + ' -> http ' + req.status +
                   (req.responseText ? ' ' + req.responseText.substring(0, 160) : ''));
-      fail(req.status);
+      var errorBody = {};
+      try { errorBody = JSON.parse(req.responseText || '{}'); } catch (e) {}
+      fail(req.status, errorBody);
       return;
     }
     var parsed;
@@ -162,91 +166,253 @@ function getJSON(url, headers, onData, onFail) {
   request('GET', url, headers, null, onData, onFail);
 }
 
-// ------------------------------------------------------------- claude tokens
-//
-// The token set lives in localStorage so a rotation survives a phone restart.
-// It is seeded from the baked-in copy, and re-seeded whenever a rebuild brings
-// a different refresh token (i.e. after you log in to Claude Code again).
+// ------------------------------------------------------------- codex tokens
 
-function loadTokens() {
-  var t = {};
-  var raw = localStorage.getItem('claude_oauth');
-  if (raw) {
-    try { t = JSON.parse(raw); } catch (e) { t = {}; }
-  }
-  var baked = SECRETS.claudeRefreshToken || '';
-  if (baked && t.seededFrom !== baked) {
-    // First run, or the build carries a newer token than what we rotated to.
-    t = {
-      refreshToken: baked,
-      accessToken: SECRETS.claudeAccessToken || '',
-      expiresAt: SECRETS.claudeExpiresAt || 0,
-      seededFrom: baked
-    };
-    localStorage.setItem('claude_oauth', JSON.stringify(t));
-    console.log('claude: seeded tokens from the build');
-  }
-  return t;
+function loadCodexTokens() {
+  var raw = localStorage.getItem('codex_oauth');
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch (e) { return {}; }
 }
 
-function saveTokens(t) {
-  localStorage.setItem('claude_oauth', JSON.stringify(t));
+function saveCodexTokens(tokens) {
+  if (!tokens || !tokens.accessToken) return;
+  localStorage.setItem('codex_oauth', JSON.stringify(tokens));
 }
 
-// Swap the refresh token for a fresh pair. The rotated refresh token is saved
-// before anything else happens: losing it means re-logging-in on the PC and
-// rebuilding, so it must never be dropped because a later step failed.
-function refreshClaudeToken(onDone, urlIndex) {
-  var t = loadTokens();
-  if (!t.refreshToken) {
-    console.log('claude: no refresh token — run tools/make_secrets.py and rebuild');
-    onDone(null);
-    return;
-  }
-  var i = urlIndex || 0;
-  if (i >= CLAUDE_TOKEN_URLS.length) {
-    console.log('claude: token refresh failed on every endpoint');
-    onDone(null);
-    return;
-  }
+function loadCodexLogin() {
+  var raw = localStorage.getItem('codex_device_login');
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
 
-  var body = JSON.stringify({
-    grant_type: 'refresh_token',
-    refresh_token: t.refreshToken,
-    client_id: CLAUDE_CLIENT_ID
-  });
+function clearCodexLogin() {
+  if (codexLoginTimer) clearTimeout(codexLoginTimer);
+  codexLoginTimer = null;
+  localStorage.removeItem('codex_device_login');
+}
 
-  // Note: Claude Code also sends User-Agent and x-app headers here. Those are
-  // forbidden headers for XHR, so the phone cannot set them — if Cloudflare
-  // starts requiring them this call returns 403 and the Claude rows go stale.
-  request('POST', CLAUDE_TOKEN_URLS[i], { 'Content-Type': 'application/json' }, body,
-    function (data) {
-      if (!data.access_token) {
-        console.log('claude: refresh response had no access_token');
-        onDone(null);
+// The authorization page never handles or returns credentials. It only shows
+// the one-time code; the companion keeps polling in the background and stores
+// the resulting token directly, even if this page is closed.
+function codexAuthorizationPage(login) {
+  return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>Connect Codex</title><style>' +
+    'body{font:16px -apple-system,Roboto,sans-serif;padding:24px;background:#111;color:#eee}' +
+    '.code{font:bold 30px monospace;letter-spacing:4px;color:#7ddc7d;text-align:center;' +
+    'padding:18px;border:1px solid #444;border-radius:8px;margin:18px 0}' +
+    'p{color:#bbb;line-height:1.5}b{color:#fff}</style></head><body>' +
+    '<h2>Connect ChatGPT Codex</h2><p>In your normal phone browser, open:</p>' +
+    '<p><b>' + CODEX_DEVICE_LOGIN_URL + '</b></p>' +
+    '<p>Enter this one-time code:</p><div class="code">' + login.user_code + '</div>' +
+    '<p>You may close this page immediately. AI Quota continues checking in the ' +
+    'phone companion and will refresh the watch automatically after authorization.</p>' +
+    '</body></html>';
+}
+
+function showCodexAuthorization(login) {
+  var url = 'data:text/html;charset=utf-8,' +
+            encodeURIComponent(codexAuthorizationPage(login));
+  Pebble.openURL(url);
+}
+
+function finishCodexLogin(raw) {
+  request('POST', CODEX_TOKEN_URL, { 'Content-Type': 'application/json' },
+    JSON.stringify({
+      client_id: CODEX_CLIENT_ID,
+      grant_type: 'authorization_code',
+      code: raw.authorization_code,
+      redirect_uri: 'https://auth.openai.com/deviceauth/callback',
+      code_verifier: raw.code_verifier
+    }),
+    function (tokens) {
+      if (!tokens.access_token || !tokens.refresh_token) {
+        console.log('codex login: token exchange returned incomplete credentials');
         return;
       }
-      var next = {
-        accessToken: data.access_token,
-        refreshToken: data.refresh_token || t.refreshToken,
-        expiresAt: Date.now() + (data.expires_in ? data.expires_in * 1000 : 3600 * 1000),
-        seededFrom: t.seededFrom
-      };
-      saveTokens(next);
-      console.log('claude: token refreshed' +
-                  (data.refresh_token ? ' (refresh token rotated — the PC copy is now dead)' : ''));
-      onDone(next.accessToken);
+      saveCodexTokens({
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        accountId: tokens.account_id || '',
+        expiresAt: Date.now() + Math.max(60, Number(tokens.expires_in) || 3600) * 1000
+      });
+      clearCodexLogin();
+      console.log('codex login: connected on phone');
+      refreshQuotas(true);
     },
-    function () { refreshClaudeToken(onDone, i + 1); });
+    function (status) { console.log('codex login: token exchange failed with status ' + status); });
 }
 
-function withClaudeToken(onToken) {
-  var t = loadTokens();
-  if (t.accessToken && t.expiresAt && t.expiresAt - TOKEN_EARLY_REFRESH_MS > Date.now()) {
-    onToken(t.accessToken);
+function pollCodexLogin(login) {
+  if (!login || Date.now() > login.deadline) {
+    console.log('codex login: device code expired');
+    clearCodexLogin();
     return;
   }
-  refreshClaudeToken(onToken);
+  request('POST', CODEX_DEVICE_POLL_URL, { 'Content-Type': 'application/json' },
+    JSON.stringify({ device_auth_id: login.device_auth_id, user_code: login.user_code }),
+    function (raw) {
+      if (raw.authorization_code) finishCodexLogin(raw);
+    },
+    function (status, raw) {
+      var code = raw && raw.error && raw.error.code;
+      if ((status === 403 && code === 'deviceauth_authorization_pending') || status === 0) {
+        codexLoginTimer = setTimeout(function () { pollCodexLogin(login); },
+          Math.max(1, Number(login.interval) || 5) * 1000);
+        return;
+      }
+      console.log('codex login: polling failed with status ' + status);
+      clearCodexLogin();
+    });
+}
+
+function startCodexLogin() {
+  clearCodexLogin();
+  request('POST', CODEX_DEVICE_CODE_URL, { 'Content-Type': 'application/json' },
+    JSON.stringify({ client_id: CODEX_CLIENT_ID }),
+    function (raw) {
+      if (!raw.device_auth_id || !raw.user_code) {
+        console.log('codex login: device-code response incomplete');
+        return;
+      }
+      var login = {
+        device_auth_id: raw.device_auth_id,
+        user_code: raw.user_code,
+        interval: Math.max(1, Number(raw.interval) || 5),
+        deadline: Date.now() + Math.max(60, Number(raw.expires_in) || 600) * 1000
+      };
+      localStorage.setItem('codex_device_login', JSON.stringify(login));
+      showCodexAuthorization(login);
+      pollCodexLogin(login);
+    },
+    function (status) { console.log('codex login: could not get device code (' + status + ')'); });
+}
+
+function finishCodexRefresh(tokens) {
+  codexRefreshInFlight = false;
+  var waiters = codexRefreshWaiters;
+  codexRefreshWaiters = [];
+  for (var i = 0; i < waiters.length; i++) waiters[i](tokens);
+}
+
+// Refresh tokens can rotate. Preserve the old one only when the response does
+// not include a replacement, and persist the complete new set before allowing
+// a waiting quota request to continue.
+function refreshCodexToken(onDone) {
+  codexRefreshWaiters.push(onDone);
+  if (codexRefreshInFlight) return;
+  codexRefreshInFlight = true;
+
+  var current = loadCodexTokens();
+  if (!current.refreshToken) {
+    console.log('codex: not connected — use the settings page to sign in');
+    finishCodexRefresh(null);
+    return;
+  }
+
+  request('POST', CODEX_TOKEN_URL, { 'Content-Type': 'application/json' },
+    JSON.stringify({
+      client_id: CODEX_CLIENT_ID,
+      grant_type: 'refresh_token',
+      refresh_token: current.refreshToken
+    }),
+    function (raw) {
+      var next = {
+        accessToken: raw.access_token || '',
+        refreshToken: raw.refresh_token || current.refreshToken,
+        accountId: raw.account_id || current.accountId || '',
+        expiresAt: Date.now() + Math.max(60, Number(raw.expires_in) || 3600) * 1000
+      };
+      if (!next.accessToken) {
+        console.log('codex: refresh response has no access token');
+        finishCodexRefresh(null);
+        return;
+      }
+      saveCodexTokens(next);
+      console.log('codex: token refreshed');
+      finishCodexRefresh(next);
+    },
+    function (status) {
+      console.log('codex: token refresh failed with status ' + status);
+      finishCodexRefresh(null);
+    });
+}
+
+function withCodexToken(onDone) {
+  var tokens = loadCodexTokens();
+  if (!tokens.accessToken) {
+    onDone(null);
+    return;
+  }
+  if (!tokens.expiresAt || Date.now() + CODEX_TOKEN_EARLY_REFRESH_MS < tokens.expiresAt) {
+    onDone(tokens);
+    return;
+  }
+  refreshCodexToken(onDone);
+}
+
+// ---------------------------------------------------------- claude calibration
+//
+// No live fetch, no token, nothing to rotate or go stale. The settings page
+// takes "how much time is left in the window right now" and this turns that
+// into an absolute reset time to push to the watch; the firmware ticks it
+// down and rolls it over to the next window on its own (advance_claude_reset
+// in main.c) without ever needing to hear from the phone again.
+
+// Accepts "Ud" / "Vh" / "Wm" in any combination (e.g. "2h30m", "4d12h"),
+// "H:MM" (colon form — hours:minutes), or a bare number using bareUnitSec for
+// its unit (60 for the 5h field's plain-minutes shorthand, 3600 for the 7d
+// field's plain-hours shorthand). Returns seconds, or null if unparseable.
+function parseDuration(str, bareUnitSec) {
+  str = (str || '').trim().toLowerCase();
+  if (!str) return null;
+  var colon = /^(\d+):(\d{1,2})$/.exec(str);
+  if (colon) return Number(colon[1]) * 3600 + Number(colon[2]) * 60;
+  var total = 0, matched = false;
+  var re = /(\d+)\s*(d|h|m)/g;
+  var m;
+  while ((m = re.exec(str)) !== null) {
+    matched = true;
+    var n = Number(m[1]);
+    if (m[2] === 'd') total += n * 86400;
+    else if (m[2] === 'h') total += n * 3600;
+    else total += n * 60;
+  }
+  if (matched) return total;
+  var bare = Number(str);
+  return isNaN(bare) ? null : bare * bareUnitSec;
+}
+
+// Turns "time left in the window, as of right now" into the AppMessage keys
+// the firmware wants (absolute epoch seconds). Blank/unparseable input means
+// "leave whatever the watch already has alone", so this only adds keys it
+// actually has a value for.
+function claudeCalibrationMessage(remain5h, remain7d) {
+  var msg = {};
+  var sec5h = parseDuration(remain5h, 60);
+  if (sec5h !== null) msg.CLAUDE_5H_RESET = Math.floor(Date.now() / 1000) + sec5h;
+  var sec7d = parseDuration(remain7d, 3600);
+  if (sec7d !== null) msg.CLAUDE_WK_RESET = Math.floor(Date.now() / 1000) + sec7d;
+  return msg;
+}
+
+// Codex's Usage panel exposes a used percentage and reset countdown, but there
+// is no documented personal-plan quota API for a Pebble companion to call.
+// Calibrate either window from the panel; blank fields leave saved watch data
+// untouched.
+function codexCalibrationMessage(pct5h, remain5h, pct7d, remain7d) {
+  var msg = {};
+  function add(prefix, pctText, remainText, bareUnitSec) {
+    if ((pctText || '').trim() !== '') {
+      var pct = Number(pctText);
+      if (!isNaN(pct)) msg[prefix + '_PCT'] = Math.max(0, Math.min(100, Math.round(pct)));
+    }
+    var seconds = parseDuration(remainText, bareUnitSec);
+    if (seconds !== null) msg[prefix + '_RESET'] = Math.floor(Date.now() / 1000) + seconds;
+  }
+  add('CODEX_5H', pct5h, remain5h, 60);
+  add('CODEX_WK', pct7d, remain7d, 3600);
+  return msg;
 }
 
 // ------------------------------------------------------------------- quotas
@@ -288,47 +454,63 @@ function merge(into, from) {
   return into;
 }
 
-// --- claude, direct
+// --- chatgpt codex, direct
 
-// api.anthropic.com reports utilization as a used percentage, 0-100.
-function claudeWindow(block) {
-  if (!block || typeof block.utilization !== 'number') return null;
-  return { used_pct: Math.round(block.utilization), reset_at: block.resets_at };
+function codexWindowMessage(win) {
+  if (!win || typeof win.used_percent !== 'number') return {};
+  var seconds = Number(win.limit_window_seconds) || 0;
+  // Older Codex plans expose 5h + 7d windows; current plans may expose only a
+  // weekly shared-agentic window. Classify by duration and leave an absent
+  // window untouched so manual fallback data remains visible.
+  var prefix = seconds > 0 && seconds <= 24 * 60 * 60 ? 'CODEX_5H' : 'CODEX_WK';
+  var reset = Number(win.reset_at) || 0;
+  if (!reset && typeof win.reset_after_seconds === 'number') {
+    reset = Math.floor(Date.now() / 1000) + win.reset_after_seconds;
+  }
+  return windowMessage(prefix, { used_pct: win.used_percent, reset_at: reset });
 }
 
-function fetchClaude(retrying) {
-  if (Date.now() < claudeBackoffUntil) {
-    console.log('claude: skipping fetch — backed off for another ' +
-                Math.ceil((claudeBackoffUntil - Date.now()) / 1000) + 's');
+function sendCodexUsage(raw) {
+  var rate = raw && raw.rate_limit;
+  if (!rate) {
+    console.log('codex: usage response has no rate_limit');
     return;
   }
-  withClaudeToken(function (token) {
-    if (!token) {
-      console.log('claude: no usable token — skipping fetch (rows will stay stuck at their last value)');
-      return;
-    }
-    getJSON(CLAUDE_USAGE_URL,
-      { Authorization: 'Bearer ' + token, 'anthropic-beta': 'oauth-2025-04-20' },
-      function (raw) {
-        var msg = {};
-        merge(msg, windowMessage('CLAUDE_5H', claudeWindow(raw.five_hour)));
-        merge(msg, windowMessage('CLAUDE_WK', claudeWindow(raw.seven_day)));
-        send(msg);
-      },
-      function (status) {
-        if (status === 429) {
-          claudeBackoffUntil = Date.now() + CLAUDE_BACKOFF_MS;
-          console.log('claude: rate limited — pausing for ' +
-                      (CLAUDE_BACKOFF_MS / 60000) + ' min');
-          return;
-        }
-        // A token can be rejected before its stated expiry — refresh once and retry.
-        if (status === 401 && !retrying) {
-          refreshClaudeToken(function (fresh) { if (fresh) fetchClaude(true); });
-          return;
-        }
-        console.log('claude: fetch failed with status ' + status + ' — rows will stay stuck at their last value');
-      });
+  var msg = {};
+  merge(msg, codexWindowMessage(rate.primary_window));
+  merge(msg, codexWindowMessage(rate.secondary_window));
+  if (Object.keys(msg).length) send(msg);
+}
+
+function fetchCodexWithToken(tokens, retried) {
+  var headers = { Authorization: 'Bearer ' + tokens.accessToken };
+  if (tokens.accountId) headers['ChatGPT-Account-Id'] = tokens.accountId;
+  getJSON(CODEX_USAGE_URL, headers,
+    function (raw) {
+      codexBackoffUntil = 0;
+      sendCodexUsage(raw);
+    },
+    function (status) {
+      if (status === 401 && !retried) {
+        // Force refresh even if the JWT's stated expiry is still in the future.
+        var stale = loadCodexTokens();
+        stale.expiresAt = 0;
+        saveCodexTokens(stale);
+        refreshCodexToken(function (fresh) {
+          if (fresh) fetchCodexWithToken(fresh, true);
+        });
+        return;
+      }
+      if (status === 429) codexBackoffUntil = Date.now() + CODEX_BACKOFF_MS;
+      console.log('codex: usage fetch failed with status ' + status +
+                  ' — keeping the last/manual values');
+    });
+}
+
+function fetchCodex() {
+  if (Date.now() < codexBackoffUntil) return;
+  withCodexToken(function (tokens) {
+    if (tokens) fetchCodexWithToken(tokens, false);
   });
 }
 
@@ -374,50 +556,67 @@ function fetchMiniMax() {
     });
 }
 
-// --- optional PC collector
-//
-// Tolerate both the nested shape and a flat one like {claude_5h_pct: 42, ...}
-function pickWindow(data, provider, which) {
-  var p = data[provider];
-  if (p) {
-    var w = p[which] || p[which === 'five_hour' ? '5h' : 'week'];
-    if (w) return w;
-  }
-  var flatKey = provider + '_' + (which === 'five_hour' ? '5h' : 'week');
-  if (data[flatKey]) return data[flatKey];
-  if (typeof data[flatKey + '_pct'] === 'number') {
-    return { used_pct: data[flatKey + '_pct'], reset_at: data[flatKey + '_reset'] };
-  }
-  return null;
+// --- github, direct
+
+function localDateString() {
+  var d = new Date();
+  function pad(n) { return n < 10 ? '0' + n : String(n); }
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-function fetchCollector(cfg) {
-  var headers = cfg.token ? { Authorization: 'Bearer ' + cfg.token } : {};
-  getJSON(cfg.url, headers, function (data) {
-    var msg = {};
-    [['claude',  'five_hour', 'CLAUDE_5H'],
-     ['claude',  'weekly',    'CLAUDE_WK'],
-     ['minimax', 'five_hour', 'MINIMAX_5H'],
-     ['minimax', 'weekly',    'MINIMAX_WK']].forEach(function (spec) {
-      merge(msg, windowMessage(spec[2], pickWindow(data, spec[0], spec[1])));
-    });
-    send(msg);
+// Commit Search gives an actual commit count rather than counting push events.
+// Without a token this covers public commits; an optional token also lets the
+// query see repositories that credential can access.
+function githubHeaders() {
+  var headers = { Accept: 'application/vnd.github+json' };
+  var token = getSettings().githubToken;
+  if (token) headers.Authorization = 'Bearer ' + token;
+  return headers;
+}
+
+function sendLatestGitHubCommit(item) {
+  var raw = item && item.commit && item.commit.author && item.commit.author.date;
+  var millis = Date.parse(raw || '');
+  if (!isNaN(millis)) {
+    send({ GITHUB_LATEST_COMMIT_AT: Math.floor(millis / 1000) });
+  }
+}
+
+function fetchLatestGitHubCommit(username) {
+  var query = 'author:' + username;
+  var url = 'https://api.github.com/search/commits?q=' + encodeURIComponent(query) +
+            '&per_page=1&sort=author-date&order=desc';
+  getJSON(url, githubHeaders(), function (raw) {
+    if (raw.items && raw.items.length) sendLatestGitHubCommit(raw.items[0]);
+  });
+}
+
+function fetchGitHubCommits() {
+  var username = (getSettings().githubUsername || '').trim();
+  if (!username) return;
+  var query = 'author:' + username + ' author-date:' + localDateString();
+  var url = 'https://api.github.com/search/commits?q=' + encodeURIComponent(query) +
+            '&per_page=1&sort=author-date&order=desc';
+  getJSON(url, githubHeaders(), function (raw) {
+    if (typeof raw.total_count !== 'number') {
+      console.log('github: search response has no total_count');
+      return;
+    }
+    send({ GITHUB_TODAY_COMMITS: raw.total_count });
+    if (raw.items && raw.items.length) {
+      sendLatestGitHubCommit(raw.items[0]);
+    } else {
+      fetchLatestGitHubCommit(username);
+    }
   });
 }
 
 function refreshQuotas(force) {
-  var cfg = getSettings();
   var now = Date.now();
   if (!force && now - lastQuotaFetch < MIN_REFRESH_GAP_MS) return;
   lastQuotaFetch = now;
-
-  // A configured collector replaces both direct fetches — it already merges the
-  // two providers, and going through it keeps the tokens off the phone.
-  if (cfg.url) {
-    fetchCollector(cfg);
-    return;
-  }
-  fetchClaude(false);
+  fetchGitHubCommits();
+  fetchCodex();
   fetchMiniMax();
 }
 
@@ -503,6 +702,8 @@ function refreshWeather() {
 
 Pebble.addEventListener('ready', function () {
   var cfg = getSettings();
+  var pendingLogin = loadCodexLogin();
+  if (pendingLogin) pollCodexLogin(pendingLogin);
   sendAppearance();
   sendTargetDate();
   refreshQuotas(true);
@@ -515,18 +716,24 @@ Pebble.addEventListener('ready', function () {
 // The watch asks for this on wrist-flick, on reconnect, and whenever its data
 // has gone stale — this is what makes the face feel live rather than polled.
 Pebble.addEventListener('appmessage', function (e) {
-  if (!e.payload || !e.payload.REQUEST_REFRESH) return;
+  if (!e.payload) return;
+  if (e.payload.AI_PROVIDER !== undefined) {
+    var cfg = getSettings();
+    cfg.aiProvider = e.payload.AI_PROVIDER ? 'codex' : 'claude';
+    saveSettings(cfg);
+  }
+  if (!e.payload.REQUEST_REFRESH) return;
   refreshQuotas();
   refreshWeather();
 });
 
 // ------------------------------------------------------------ configuration
 
-// Settings page. With the tokens baked in there is no collector to host it, so
-// it is served as a data: URL. Some phone apps refuse to navigate to those — if
-// the gear icon does nothing, the settings below are all available in DEFAULTS
-// at the top of this file instead, and a running collector's /config still wins.
-function configPage(cfg) {
+// Settings page, served as a data: URL — no collector, no origin needed. Some
+// phone apps refuse to navigate to data: URLs; if the gear icon does nothing,
+// the non-Claude settings below are all available in DEFAULTS at the top of
+// this file instead.
+function configPage(cfg, codexConnected, codexPending) {
   return '<!DOCTYPE html><html><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>AI Quota</title><style>' +
@@ -537,9 +744,50 @@ function configPage(cfg) {
     'border:1px solid #444;border-radius:6px;background:#1c1c1c;color:#eee}' +
     'button{width:100%;margin-top:22px;padding:13px;font-size:16px;border:0;' +
     'border-radius:6px;background:#e07b39;color:#fff}' +
+    'fieldset{border:1px solid #333;border-radius:8px;margin:20px 0 0;padding:12px}' +
+    'legend{padding:0 6px;font-size:13px;color:#bbb}' +
+    '.code{font:bold 26px monospace;letter-spacing:3px;color:#7ddc7d;text-align:center}' +
+    '.loginlink{display:block;text-align:center;margin:12px 0;color:#6bbcff}' +
+    '.secondary{background:#444;margin-top:10px}' +
     '</style></head><body><h1>AI Quota</h1>' +
-    '<p>Quotas come straight from the phone. Leave the collector URL blank unless ' +
-    'you run tools/quota_collector.py.</p>' +
+    '<p>The first row shows today’s GitHub commits. MiniMax quota is fetched live. ' +
+    'Claude has no live quota API the phone can ' +
+    'use reliably, so its 7-day window is a countdown you calibrate below.</p>' +
+    '<label>GitHub username</label>' +
+    '<input id="githubUsername" value="' + cfg.githubUsername + '" placeholder="e.g. LinBlink">' +
+    '<label>GitHub read-only token (blank = keep current)</label>' +
+    '<input id="githubToken" type="password" value="" placeholder="Needed for private repositories">' +
+    '<p style="margin:6px 0 0">Only commits already pushed to GitHub can be counted.</p>' +
+    '<label>7-day quota row</label><select id="aiProvider">' +
+    '<option value="claude"' + (cfg.aiProvider === 'claude' ? ' selected' : '') + '>Claude</option>' +
+    '<option value="codex"' + (cfg.aiProvider === 'codex' ? ' selected' : '') + '>ChatGPT Codex</option>' +
+    '</select>' +
+    '<p style="margin:6px 0 0">Press the watch select button to switch the 7D row instantly.</p>' +
+    '<fieldset><legend>Claude — calibrate remaining time</legend>' +
+    '<p style="margin:0 0 10px">Check claude.ai/settings/usage (or `claude /usage`) ' +
+    'for how much is left in each window right now, then enter it here. Formats: ' +
+    '"4d12h", "2:30" (H:MM), or a bare number (hours). ' +
+    'Leave blank to leave the watch’s current countdown alone.</p>' +
+    '<label>7-day window: time left</label>' +
+    '<input id="claude7d" value="" placeholder="e.g. 4d12h">' +
+    '</fieldset>' +
+    '<fieldset><legend>ChatGPT Codex — automatic sync</legend>' +
+    '<p id="codexStatus" style="margin:0 0 10px">' +
+    (codexConnected ? 'Connected. The phone refreshes the token and quota over Wi-Fi or cellular.' :
+     codexPending ? 'Authorization is pending in the phone companion.' :
+                    'Not connected. Authorization runs on the phone; no computer is needed.') + '</p>' +
+    '<button type="button" id="codexLogin">' +
+    (codexConnected ? 'Reconnect Codex' : 'Connect Codex') + '</button>' +
+    '<button type="button" id="codexDisconnect" class="secondary"' +
+    (codexConnected ? '' : ' style="display:none"') + '>Disconnect Codex</button>' +
+    '<p style="margin:10px 0">Connect closes settings and displays a one-time code. ' +
+    'Open the shown address manually in Chrome or Safari. The companion keeps ' +
+    'checking authorization after that page is closed.</p>' +
+    '<p style="margin:14px 0 10px">Manual fallback: copy values from Codex Settings → Usage. ' +
+    'Blank fields preserve the last automatic or manual values.</p>' +
+    '<label>7-day used %</label><input id="codex7pct" type="number" min="0" max="100" placeholder="e.g. 61">' +
+    '<label>7-day time left</label><input id="codex7d" placeholder="e.g. 2d8h">' +
+    '</fieldset>' +
     '<label>Countdown target date (blank = hide)</label>' +
     '<input id="targetDate" type="date" value="' + cfg.targetDate + '">' +
     '<label>Weather latitude (blank = phone GPS)</label>' +
@@ -559,41 +807,39 @@ function configPage(cfg) {
     '</select>' +
     '<label>Refresh interval (minutes)</label>' +
     '<input id="refreshMin" type="number" min="1" value="' + cfg.refreshMin + '">' +
-    '<label>Collector URL (optional)</label><input id="url" value="' + cfg.url + '">' +
-    '<label>Collector token (optional)</label><input id="token" value="' + cfg.token + '">' +
     '<button id="save">Save</button><script>' +
-    'document.getElementById("save").onclick=function(){' +
-    'var g=function(i){return document.getElementById(i).value.trim()};' +
-    'var out={url:g("url"),token:g("token"),refreshMin:parseInt(g("refreshMin"),10)||5,' +
+    'var codexStart=false,codexClear=false;' +
+    'function statusText(s){document.getElementById("codexStatus").textContent=s}' +
+    'function formResult(){var g=function(i){return document.getElementById(i).value.trim()};' +
+    'return {refreshMin:parseInt(g("refreshMin"),10)||5,' +
     'units:g("units"),lat:g("lat"),lon:g("lon"),targetDate:g("targetDate"),' +
-    'theme:g("theme"),timeFont:g("timeFont")};' +
-    'location.href="pebblejs://close#"+encodeURIComponent(JSON.stringify(out))};' +
+    'githubUsername:g("githubUsername"),' +
+    'githubToken:g("githubToken"),' +
+    'theme:g("theme"),timeFont:g("timeFont"),aiProvider:g("aiProvider"),' +
+    'claude7d:g("claude7d"),' +
+    'codex7pct:g("codex7pct"),codex7d:g("codex7d"),' +
+    'codexStart:codexStart,codexClear:codexClear}}' +
+    'function saveAndClose(){location.href="pebblejs://close#"+' +
+    'encodeURIComponent(JSON.stringify(formResult()))}' +
+    'document.getElementById("codexLogin").onclick=function(){' +
+    'codexStart=true;codexClear=false;statusText("Starting authorization on this phone…");saveAndClose()};' +
+    'document.getElementById("codexDisconnect").onclick=function(){' +
+    'codexStart=false;codexClear=true;statusText("Disconnecting…");saveAndClose()};' +
+    'document.getElementById("save").onclick=saveAndClose;' +
     '<\/script></body></html>';
-}
-
-// A running collector serves the same page at /config, from a real origin.
-function collectorConfigUrl(cfg) {
-  var m = /^(https?:\/\/[^/?#]+)/.exec(cfg.url);
-  if (!m) return null;
-  var current = {
-    url: cfg.url, token: cfg.token, refreshMin: cfg.refreshMin,
-    units: cfg.units, lat: cfg.lat, lon: cfg.lon, targetDate: cfg.targetDate,
-    theme: cfg.theme, timeFont: cfg.timeFont
-  };
-  return m[1] + '/config?current=' + encodeURIComponent(JSON.stringify(current));
 }
 
 Pebble.addEventListener('showConfiguration', function () {
   var url;
   try {
-    var cfg = getSettings();
-    url = collectorConfigUrl(cfg);
-    if (!url) url = 'data:text/html;charset=utf-8,' + encodeURIComponent(configPage(cfg));
+    url = 'data:text/html;charset=utf-8,' +
+          encodeURIComponent(configPage(getSettings(), !!loadCodexTokens().refreshToken,
+                                         !!loadCodexLogin()));
   } catch (e) {
     // Never leave the gear icon silently dead: a broken settings object should
     // still get you a page you can type into.
     console.log('config build error: ' + e);
-    url = 'data:text/html;charset=utf-8,' + encodeURIComponent(configPage(DEFAULTS));
+    url = 'data:text/html;charset=utf-8,' + encodeURIComponent(configPage(DEFAULTS, false, false));
   }
   console.log('showConfiguration -> ' + url.substring(0, 40) + '… (' + url.length + ' chars)');
   Pebble.openURL(url);
@@ -602,11 +848,28 @@ Pebble.addEventListener('showConfiguration', function () {
 Pebble.addEventListener('webviewclosed', function (e) {
   if (!e.response) return;
   try {
-    saveSettings(JSON.parse(decodeURIComponent(e.response)));
+    var parsed = JSON.parse(decodeURIComponent(e.response));
+    if (!parsed.githubToken) parsed.githubToken = getSettings().githubToken;
+    var calibration = claudeCalibrationMessage('', parsed.claude7d);
+    merge(calibration, codexCalibrationMessage('', '',
+                                                parsed.codex7pct, parsed.codex7d));
+    delete parsed.claude7d;
+    delete parsed.codex7pct;
+    delete parsed.codex7d;
+    if (parsed.codexClear) {
+      localStorage.removeItem('codex_oauth');
+      clearCodexLogin();
+    }
+    var startCodex = parsed.codexStart;
+    delete parsed.codexClear;
+    delete parsed.codexStart;
+    saveSettings(parsed);
     sendAppearance();
     sendTargetDate();
+    send(calibration);
     refreshQuotas(true);
     refreshWeather();
+    if (startCodex) startCodexLogin();
   } catch (err) {
     console.log('config parse error: ' + err);
   }

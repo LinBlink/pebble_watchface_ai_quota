@@ -2,8 +2,8 @@
 
 # ⌚ AI Quota Watchface
 
-A Pebble Time (`basalt`) watchface that shows time, weather and your **Claude**
-and **MiniMax** AI usage quotas live on your wrist.
+A Pebble Time (`basalt`) watchface that shows time, weather, today's **GitHub**
+commits, and your **Claude**, **ChatGPT Codex**, and **MiniMax** usage.
 
 [![Pebble SDK 3](https://img.shields.io/badge/Pebble%20SDK-3-brightgreen)](https://developer.rebble.io)
 [![Platform](https://img.shields.io/badge/Platform-basalt-blue.svg)](#)
@@ -16,10 +16,13 @@ and **MiniMax** AI usage quotas live on your wrist.
 
 ## ✨ Features
 
-- **Time & date** — big bold time, date, and a live countdown to 22:00.
+- **Time & date** — big bold time, date, a live countdown to 22:00, and days
+  until the next March 28 birthday.
 - **Weather** — today / +6h / +24h forecast from [Open-Meteo](https://open-meteo.com) (free, no key).
-- **AI quota rows** — Claude (orange) and MiniMax (blue) usage for the 5-hour
-  and 7-day windows, each showing:
+- **GitHub activity** — the `GHD` row shows today's authored commit count and
+  the most recent commit time (or its date when it was before today).
+- **AI quota rows** — switch the 7-day row between Claude (orange) and ChatGPT
+  Codex (green) with the watch select button; MiniMax stays visible in blue:
   - used percentage + a progress bar
   - time until the window resets
 - **Stale detection** — percentages turn **grey** when the last sync is over
@@ -33,7 +36,7 @@ Fri 08-14           59m        ← date | countdown to 22:00
  NOW     +6H     +24H
  21°     19°      -8°
 Clear   Rain    Cloud
-CL 5H     8%    4h48           ← Claude 5-hour window
+GHD       12    14:05           ← GitHub commits today | latest commit
 CL 7D     3%    6d23           ← Claude weekly window
 MM 5H     1%    2h38           ← MiniMax 5-hour window
 MM 7D    57%    2d2h           ← MiniMax weekly window
@@ -65,29 +68,34 @@ Watch-initiated fetches are throttled to one per 20 s on the phone side.
 
 ```
 phone (pkjs)  →  watch
-   ├── api.anthropic.com/api/oauth/usage   (Claude, OAuth token refreshed on the phone)
+   ├── api.github.com/search/commits         (today's commits)
+   ├── chatgpt.com/backend-api/wham/usage  (Codex, phone device login)
    ├── api.minimaxi.com/v1/token_plan/remains
    └── api.open-meteo.com                  (weather)
 ```
 
-The phone fetches everything itself, so the watchface keeps working away from
-this machine. `tools/make_secrets.py` bakes the credentials into the build — see
-[Credentials on the phone](#credentials-on-the-phone).
+The phone fetches GitHub, Codex, MiniMax, and weather itself, so the watchface
+works away from this machine, including on cellular data. Claude is a locally
+rolling countdown calibrated in settings.
 
-An optional PC collector (`tools/quota_collector.py`) is still supported and
-takes precedence — set `DEFAULTS.url` and the phone reads that instead, keeping
-the tokens off the phone entirely:
-
-```
-PC (tools/quota_collector.py)  →  relay (tunnel or gist)  →  phone (pkjs)  →  watch
-```
+**GitHub** — the companion searches every GitHub repository visible to the
+request for commits authored by `github_username` on the phone's local date.
+Public commits require no token. Set an optional read-only `github_token` to
+include private repositories that token can access. Local commits are invisible
+until they are pushed to GitHub.
 
 ### Data sources
 
-**Claude** — `GET https://api.anthropic.com/api/oauth/usage` with the token from
-`~/.claude/.credentials.json` plus `anthropic-beta: oauth-2025-04-20`. Returns
-`five_hour.utilization` / `seven_day.utilization` (0–100) and `resets_at`.
-This is an unofficial internal endpoint and can change without notice.
+**Claude** — enter the time remaining for each window in settings. The watch
+derives elapsed percentage locally and advances expired windows without a
+network request.
+
+**ChatGPT Codex** — the phone companion owns the complete device-code flow.
+Choose **Connect Codex**, then manually open the displayed address in the
+phone's normal browser and enter the one-time code. The companion keeps polling
+after its page is closed, stores and refreshes its own OAuth token, and reads
+quota from `chatgpt.com/backend-api/wham/usage` over Wi-Fi or cellular.
+Because this is an internal endpoint, manual calibration remains available.
 
 **MiniMax** — `GET https://api.minimaxi.com/v1/token_plan/remains` with
 `Authorization: Bearer <coding plan key>`. Note the host: `api.minimaxi.com`
@@ -102,32 +110,22 @@ is inverted — MiniMax reports what's **left**, the watch shows what's **used**
 
 ### Credentials on the phone
 
-> ⚠️ **Read before enabling direct fetch.** The built `.pbw` carries a live
-> Claude **refresh token** and the MiniMax API key — the installed app on your
-> phone holds both.
-
-- **Claude's refresh token rotates on use.** The first time the phone refreshes,
-  the copy in `~/.claude/.credentials.json` is dead and Claude Code will ask you
-  to log in again. Re-run `python tools/make_secrets.py` and reinstall to
-  re-seed the phone.
-- A refresh token is a long-lived account credential. Losing the phone is a
-  bigger deal than it was.
-- The phone cannot set `User-Agent` / `Cookie` headers (forbidden XHR headers),
-  so the refresh call goes out without them. If Cloudflare starts requiring
-  them, the call returns 403 and the Claude rows go stale.
+The built `.pbw` contains the MiniMax key. Codex credentials are not baked into
+the package: device login stores them in Pebble companion `localStorage` on the
+phone. A Codex refresh token is still a long-lived account credential; use
+**Disconnect Codex** in settings before transferring or disposing of the phone.
 
 ## ⚙️ Configuration
 
 `config.json` in the project root holds the secrets:
 
 ```json
-{ "minimax_key": "sk-cp-...", "claude_cookie": "..." }
+{ "minimax_key": "sk-cp-...", "github_username": "LinBlink" }
 ```
 
 - `minimax_key` — required for the MiniMax rows; without it they stay blank.
-- `claude_cookie` — unused; the OAuth token from `~/.claude/.credentials.json`
-  is preferred, since Claude Code keeps it fresh automatically.
 - Optional: `minimax_url`, `minimax_model`.
+- Optional: `github_username` (defaults to `LinBlink`) and `github_token`.
 
 > 🔒 **This file contains live credentials. It is gitignored.**
 
@@ -177,8 +175,8 @@ pebble build
 pebble install --emulator basalt
 ```
 
-`make_secrets.py` reads `~/.claude/.credentials.json` and `config.json` and
-inlines them into `src/pkjs/pebble-js-app.js`, rendered from
+`make_secrets.py` reads `config.json` and inlines the MiniMax settings into
+`src/pkjs/pebble-js-app.js`, rendered from
 `src/pkjs-template/index.js`. **Edit the template** — the generated file is
 overwritten on every run and is gitignored because it holds live tokens.
 
@@ -187,7 +185,9 @@ overwritten on every run and is gitignored because it holds live tokens.
 Everything is baked in at build time, so the watchface works with **no settings
 page at all**. The gear icon opens one for later tweaks — theme (light/dark),
 clock font (Bitham / Consolas-like digits), refresh interval, °C/°F, fixed
-lat/lon, and the optional collector URL/token.
+lat/lon, Claude/Codex display selection, Codex device login, and manual quota
+calibration. Blank calibration fields preserve values already stored on the
+watch when automatic Codex sync is unavailable.
 
 That page is served as a `data:` URL (with direct fetching there is no collector
 hosting it). Some phone apps refuse to navigate to `data:` URLs; if the gear
