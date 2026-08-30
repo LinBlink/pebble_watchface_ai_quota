@@ -65,6 +65,13 @@
           "characterRegex": "[0-9:]",
           "pixelHeight": 36,
           "trackingAdjust": -1
+        },
+        {
+          "type": "font",
+          "name": "FONT_BANK_LABELS_11",
+          "file": "fonts/bank_labels.ttf",
+          "characterRegex": "[南京银行招商工]",
+          "pixelHeight": 11
         }
       ]
     }

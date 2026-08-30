@@ -167,6 +167,7 @@ static const Theme THEMES[2] = {
 
 static Window *s_window;
 static GFont s_consolas_font;          // loaded at window_load, freed at unload
+static GFont s_bank_font;              // compact Chinese bank labels
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
@@ -243,9 +244,9 @@ static char s_reset_buf[ROW_COUNT][12];
 #define BANK_Y        79
 #define BANK_H        20
 #define BANK_META_X   3
-#define BANK_META_W   24
-#define BANK_VALUE_X  27
-#define BANK_VALUE_W  58
+#define BANK_META_W   40
+#define BANK_VALUE_X  43
+#define BANK_VALUE_W  42
 #define BANK_SUM_X    87
 #define BANK_SUM_W    54
 #define SEP2_Y        99
@@ -509,7 +510,7 @@ static void format_bank_balance(char *buf, size_t size, int64_t cents) {
 }
 
 static void update_bank(void) {
-  static const char *labels[] = { "NJ", "ZS", "GS" };
+  static const char *labels[] = { "南京银行", "招商银行", "工商银行" };
   int32_t balance = -1;
   int32_t updated = 0;
   bool has_balance = false;
@@ -1146,6 +1147,7 @@ static void window_load(Window *window) {
   window_set_background_color(window, THEMES[s_theme].bg);
 
   s_consolas_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_CONSOLAS_38));
+  s_bank_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_BANK_LABELS_11));
 
   s_time_layer = make_text(root, GRect(0, TIME_Y, SCREEN_W, TIME_H),
                            time_font(), GTextAlignmentCenter, THEMES[s_theme].fg);
@@ -1199,10 +1201,10 @@ static void window_load(Window *window) {
   s_separators[1] = separator(root, SEP_WX_Y);
 
   s_bank_meta_layer = make_text(root,
-                                GRect(BANK_META_X, BANK_Y + 2, BANK_META_W, BANK_H),
-                                fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                                GRect(BANK_META_X, BANK_Y + 3, BANK_META_W, BANK_H),
+                                s_bank_font,
                                 GTextAlignmentLeft, THEMES[s_theme].fg_dim);
-  text_layer_set_text(s_bank_meta_layer, "BANK");
+  text_layer_set_text(s_bank_meta_layer, "南京银行");
 
   s_bank_balance_layer = make_text(root,
                                    GRect(BANK_VALUE_X, BANK_Y - 2,
@@ -1265,6 +1267,7 @@ static void window_unload(Window *window) {
   text_layer_destroy(s_bank_meta_layer);
   text_layer_destroy(s_bank_balance_layer);
   text_layer_destroy(s_bank_sum_layer);
+  fonts_unload_custom_font(s_bank_font);
   fonts_unload_custom_font(s_consolas_font);
   layer_destroy(s_rows_layer);
   layer_destroy(s_status_layer);
