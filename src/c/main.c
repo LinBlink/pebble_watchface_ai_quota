@@ -29,8 +29,6 @@ static const RowSpec ROWS[ROW_COUNT] = {
   { "MM 7D", false, true  },
 };
 
-static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
-
 // Persistent storage keys
 #define PERSIST_PCT(i)     (100 + (i) * 2)
 #define PERSIST_RESET(i)   (100 + (i) * 2 + 1)
@@ -158,8 +156,8 @@ static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
 static TextLayer *s_birthday_layer;
 static TextLayer *s_dday_layer;
-static TextLayer *s_wx_label_layers[WX_COUNT];
 static TextLayer *s_wx_temp_layers[WX_COUNT];
+static Layer *s_wx_icons_layer;
 static TextLayer *s_bank_meta_layer;
 static TextLayer *s_bank_balance_layer;
 static TextLayer *s_separators[3];
@@ -211,12 +209,11 @@ static char s_reset_buf[ROW_COUNT][12];
 
 #define SEP1_Y        57
 
-// Three compact text-only columns keep NOW/+6H/+24H visible while reserving
-// the next full line for the bank balance.
+// Three compact icon/temperature columns represent now, +6h and +24h by
+// position while reserving the next full line for the bank balance.
 #define WX_COL_W      (SCREEN_W / WX_COUNT)
-#define WX_LABEL_Y    58
-#define WX_LABEL_H    20
-#define WX_LABEL_W    20
+#define WX_Y          58
+#define WX_H          20
 #define WX_TEMP_X     20
 #define WX_TEMP_W     28
 #define WX_TEMP_H     20
@@ -242,6 +239,103 @@ static char s_reset_buf[ROW_COUNT][12];
 #define R_LABEL_W     42
 #define R_PCT_W       44
 #define R_RESET_W     52
+
+// ------------------------------------------------------------ weather icons
+
+typedef enum {
+  WX_SUN, WX_SUN_CLOUD, WX_CLOUD, WX_FOG,
+  WX_DRIZZLE, WX_RAIN, WX_SNOW, WX_STORM, WX_UNKNOWN
+} WxIcon;
+
+static WxIcon wmo_icon(int32_t code) {
+  if (code < 0) return WX_UNKNOWN;
+  if (code <= 1) return WX_SUN;
+  if (code == 2) return WX_SUN_CLOUD;
+  if (code == 3) return WX_CLOUD;
+  if (code == 45 || code == 48) return WX_FOG;
+  if (code >= 51 && code <= 57) return WX_DRIZZLE;
+  if ((code >= 61 && code <= 67) || (code >= 80 && code <= 82)) return WX_RAIN;
+  if ((code >= 71 && code <= 77) || code == 85 || code == 86) return WX_SNOW;
+  if (code >= 95) return WX_STORM;
+  return WX_UNKNOWN;
+}
+
+static void draw_small_sun(GContext *ctx, int x, int y) {
+  GColor color = THEMES[s_theme].accent;
+  graphics_context_set_fill_color(ctx, color);
+  graphics_context_set_stroke_color(ctx, color);
+  graphics_fill_circle(ctx, GPoint(x + 9, y + 9), 3);
+  graphics_draw_line(ctx, GPoint(x + 9, y + 3), GPoint(x + 9, y + 1));
+  graphics_draw_line(ctx, GPoint(x + 9, y + 15), GPoint(x + 9, y + 17));
+  graphics_draw_line(ctx, GPoint(x + 3, y + 9), GPoint(x + 1, y + 9));
+  graphics_draw_line(ctx, GPoint(x + 15, y + 9), GPoint(x + 17, y + 9));
+}
+
+static void draw_small_cloud(GContext *ctx, int x, int y, GColor color) {
+  int base = y + 11;
+  graphics_context_set_fill_color(ctx, color);
+  graphics_fill_circle(ctx, GPoint(x + 5, base), 3);
+  graphics_fill_circle(ctx, GPoint(x + 9, base - 2), 4);
+  graphics_fill_circle(ctx, GPoint(x + 13, base), 3);
+  graphics_fill_rect(ctx, GRect(x + 3, base, 12, 4), 0, GCornerNone);
+}
+
+static void draw_small_wx_icon(GContext *ctx, int x, WxIcon icon) {
+  x += 1;
+  switch (icon) {
+    case WX_SUN:
+      draw_small_sun(ctx, x, 1);
+      break;
+    case WX_SUN_CLOUD:
+      draw_small_sun(ctx, x + 4, -1);
+      draw_small_cloud(ctx, x, 4, THEMES[s_theme].cloud);
+      break;
+    case WX_CLOUD:
+      draw_small_cloud(ctx, x, 3, THEMES[s_theme].cloud);
+      break;
+    case WX_FOG:
+      graphics_context_set_stroke_color(ctx, THEMES[s_theme].fog);
+      graphics_draw_line(ctx, GPoint(x + 2, 5), GPoint(x + 16, 5));
+      graphics_draw_line(ctx, GPoint(x + 4, 9), GPoint(x + 14, 9));
+      graphics_draw_line(ctx, GPoint(x + 2, 13), GPoint(x + 16, 13));
+      break;
+    case WX_DRIZZLE:
+    case WX_RAIN:
+      draw_small_cloud(ctx, x, 0, THEMES[s_theme].cloud);
+      graphics_context_set_stroke_color(ctx, GColorPictonBlue);
+      for (int i = 0; i < 3; i++) {
+        int drop_x = x + 5 + i * 4;
+        int len = icon == WX_RAIN ? 4 : 2;
+        graphics_draw_line(ctx, GPoint(drop_x, 14), GPoint(drop_x - 1, 14 + len));
+      }
+      break;
+    case WX_SNOW:
+      draw_small_cloud(ctx, x, 0, THEMES[s_theme].cloud);
+      graphics_context_set_fill_color(ctx, THEMES[s_theme].snow);
+      for (int i = 0; i < 3; i++) {
+        graphics_fill_circle(ctx, GPoint(x + 5 + i * 4, 16), 1);
+      }
+      break;
+    case WX_STORM:
+      draw_small_cloud(ctx, x, 0, GColorDarkGray);
+      graphics_context_set_stroke_color(ctx, THEMES[s_theme].bolt);
+      graphics_draw_line(ctx, GPoint(x + 10, 12), GPoint(x + 7, 16));
+      graphics_draw_line(ctx, GPoint(x + 7, 16), GPoint(x + 11, 16));
+      graphics_draw_line(ctx, GPoint(x + 11, 16), GPoint(x + 9, 19));
+      break;
+    default:
+      graphics_context_set_stroke_color(ctx, THEMES[s_theme].fg_dim);
+      graphics_draw_line(ctx, GPoint(x + 5, 10), GPoint(x + 13, 10));
+      break;
+  }
+}
+
+static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
+  for (int i = 0; i < WX_COUNT; i++) {
+    WxIcon icon = s_temp[i] == NO_TEMP ? WX_UNKNOWN : wmo_icon(s_code[i]);
+    draw_small_wx_icon(ctx, i * WX_COL_W, icon);
+  }
+}
 
 // ---------------------------------------------------------------- formatting
 
@@ -398,6 +492,7 @@ static void update_weather(void) {
     }
     text_layer_set_text(s_wx_temp_layers[i], s_wx_temp_buf[i]);
   }
+  layer_mark_dirty(s_wx_icons_layer);
 }
 
 static void update_bank(void) {
@@ -633,10 +728,8 @@ static void apply_theme(void) {
   text_layer_set_text_color(s_birthday_layer, t->fg_dim);
   text_layer_set_text_color(s_dday_layer, t->fg);
 
-  for (int i = 0; i < WX_COUNT; i++) {
-    text_layer_set_text_color(s_wx_label_layers[i], t->fg_dim);
+  for (int i = 0; i < WX_COUNT; i++)
     text_layer_set_text_color(s_wx_temp_layers[i], t->fg);
-  }
   text_layer_set_text_color(s_bank_meta_layer, t->fg_dim);
 
   text_layer_set_background_color(s_separators[0], t->separator);
@@ -653,6 +746,7 @@ static void apply_theme(void) {
   update_rows(time(NULL));
   update_bank();
   layer_mark_dirty(s_status_layer);
+  layer_mark_dirty(s_wx_icons_layer);
 }
 
 // ------------------------------------------------------------------ app msg
@@ -928,17 +1022,14 @@ static void window_load(Window *window) {
 
   s_separators[0] = separator(root, SEP1_Y);
 
+  s_wx_icons_layer = layer_create(GRect(0, WX_Y, SCREEN_W, WX_H));
+  layer_set_update_proc(s_wx_icons_layer, wx_icons_update_proc);
+  layer_add_child(root, s_wx_icons_layer);
+
   for (int i = 0; i < WX_COUNT; i++) {
     int x = i * WX_COL_W;
-    s_wx_label_layers[i] = make_text(root,
-                                     GRect(x, WX_LABEL_Y + 3,
-                                           WX_LABEL_W, WX_LABEL_H),
-                                     fonts_get_system_font(FONT_KEY_GOTHIC_09),
-                                     GTextAlignmentRight, THEMES[s_theme].fg_dim);
-    text_layer_set_text(s_wx_label_layers[i], WX_LABELS[i]);
-
     s_wx_temp_layers[i] = make_text(root,
-                                    GRect(x + WX_TEMP_X, WX_LABEL_Y,
+                                    GRect(x + WX_TEMP_X, WX_Y,
                                           WX_TEMP_W, WX_TEMP_H),
                                     fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
                                     GTextAlignmentCenter, THEMES[s_theme].fg);
@@ -997,9 +1088,9 @@ static void window_unload(Window *window) {
     text_layer_destroy(s_reset_layers[i]);
   }
   for (int i = 0; i < WX_COUNT; i++) {
-    text_layer_destroy(s_wx_label_layers[i]);
     text_layer_destroy(s_wx_temp_layers[i]);
   }
+  layer_destroy(s_wx_icons_layer);
   text_layer_destroy(s_bank_meta_layer);
   text_layer_destroy(s_bank_balance_layer);
   fonts_unload_custom_font(s_consolas_font);
