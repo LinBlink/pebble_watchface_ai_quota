@@ -34,6 +34,8 @@ static const RowSpec ROWS[ROW_COUNT] = {
 #define PERSIST_RESET(i)   (100 + (i) * 2 + 1)
 #define PERSIST_TEMP(i)    (200 + (i) * 2)
 #define PERSIST_CODE(i)    (200 + (i) * 2 + 1)
+#define PERSIST_SUNRISE    206
+#define PERSIST_SUNSET     207
 #define PERSIST_LAST_SYNC(p) (320 + (p))  // 0 = claude, 1 = minimax
 #define PERSIST_TARGET     301
 #define PERSIST_THEME      310
@@ -93,6 +95,8 @@ static int32_t s_codex_pct[2];       // manually calibrated Codex 5h / 7d usage
 static int32_t s_codex_reset[2];     // Codex reset timestamps, kept across display switches
 static int32_t s_temp[WX_COUNT];     // NO_TEMP = no data yet
 static int32_t s_code[WX_COUNT];     // WMO weather code
+static int32_t s_sunrise;
+static int32_t s_sunset;
 // UTC epoch of the last quota push per provider (0 = claude, 1 = minimax), 0 =
 // never. Tracked separately because the two providers fail independently — if
 // only one of them is actually landing pushes, its rows must grey out on their
@@ -118,6 +122,7 @@ static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
 static int s_bank_display_index;     // NJ, CMB, ICBC, then total
 static bool s_show_lunar;
+static bool s_show_sun_times;
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -194,6 +199,8 @@ static char s_countdown_buf[10];
 static char s_birthday_buf[12];
 static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
+static char s_sunrise_buf[12];
+static char s_sunset_buf[12];
 static char s_bank_balance_buf[20];
 static char s_bank_sum_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
@@ -244,6 +251,7 @@ static void update_date(struct tm *t);
 #define WX_TEMP_X     20
 #define WX_TEMP_W     28
 #define WX_TEMP_H     20
+#define SUN_COL_W      (SCREEN_W / 2)
 #define SEP_WX_Y      78
 
 #define BANK_Y        79
@@ -360,6 +368,7 @@ static void draw_small_wx_icon(GContext *ctx, int x, WxIcon icon) {
 }
 
 static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
+  if (s_show_sun_times) return;
   for (int i = 0; i < WX_COUNT; i++) {
     WxIcon icon = s_temp[i] == NO_TEMP ? WX_UNKNOWN : wmo_icon(s_code[i]);
     draw_small_wx_icon(ctx, i * WX_COL_W, icon);
@@ -489,12 +498,43 @@ static void update_rows(time_t now) {
 }
 
 static void update_weather(void) {
+  if (s_show_sun_times) {
+    if (s_sunrise > 0) {
+      time_t sunrise_at = s_sunrise;
+      struct tm *sunrise = localtime(&sunrise_at);
+      strftime(s_sunrise_buf, sizeof(s_sunrise_buf), "UP %H:%M", sunrise);
+    } else {
+      snprintf(s_sunrise_buf, sizeof(s_sunrise_buf), "UP --:--");
+    }
+    if (s_sunset > 0) {
+      time_t sunset_at = s_sunset;
+      struct tm *sunset = localtime(&sunset_at);
+      strftime(s_sunset_buf, sizeof(s_sunset_buf), "DN %H:%M", sunset);
+    } else {
+      snprintf(s_sunset_buf, sizeof(s_sunset_buf), "DN --:--");
+    }
+    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[0]),
+                    GRect(0, WX_Y, SUN_COL_W, WX_TEMP_H));
+    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[1]),
+                    GRect(SUN_COL_W, WX_Y, SUN_COL_W, WX_TEMP_H));
+    text_layer_set_text_alignment(s_wx_temp_layers[0], GTextAlignmentCenter);
+    text_layer_set_text_alignment(s_wx_temp_layers[1], GTextAlignmentCenter);
+    text_layer_set_text(s_wx_temp_layers[0], s_sunrise_buf);
+    text_layer_set_text(s_wx_temp_layers[1], s_sunset_buf);
+    text_layer_set_text(s_wx_temp_layers[2], "");
+    layer_mark_dirty(s_wx_icons_layer);
+    return;
+  }
   for (int i = 0; i < WX_COUNT; i++) {
     if (s_temp[i] == NO_TEMP) {
       snprintf(s_wx_temp_buf[i], sizeof(s_wx_temp_buf[i]), "--");
     } else {
       snprintf(s_wx_temp_buf[i], sizeof(s_wx_temp_buf[i]), "%ld°", (long)s_temp[i]);
     }
+    int x = i * WX_COL_W;
+    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[i]),
+                    GRect(x + WX_TEMP_X, WX_Y, WX_TEMP_W, WX_TEMP_H));
+    text_layer_set_text_alignment(s_wx_temp_layers[i], GTextAlignmentCenter);
     text_layer_set_text(s_wx_temp_layers[i], s_wx_temp_buf[i]);
   }
   layer_mark_dirty(s_wx_icons_layer);
@@ -580,8 +620,10 @@ static void bank_timer_handler(void *context) {
   s_bank_timer = NULL;
   s_bank_display_index = (s_bank_display_index + 1) % 3;
   s_show_lunar = !s_show_lunar;
+  s_show_sun_times = !s_show_sun_times;
   time_t now = time(NULL);
   update_date(localtime(&now));
+  update_weather();
   update_bank();
   s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
 }
@@ -1134,6 +1176,10 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   apply_weather(it, MESSAGE_KEY_WX_TEMP_NOW, MESSAGE_KEY_WX_CODE_NOW, 0);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_6H, MESSAGE_KEY_WX_CODE_6H, 1);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_24H, MESSAGE_KEY_WX_CODE_24H, 2);
+  Tuple *sunrise = dict_find(it, MESSAGE_KEY_WX_SUNRISE);
+  Tuple *sunset = dict_find(it, MESSAGE_KEY_WX_SUNSET);
+  if (sunrise) store_int(PERSIST_SUNRISE, &s_sunrise, sunrise->value->int32);
+  if (sunset) store_int(PERSIST_SUNSET, &s_sunset, sunset->value->int32);
 
   Tuple *target = dict_find(it, MESSAGE_KEY_TARGET_DATE);
   if (target) store_int(PERSIST_TARGET, &s_target_date, target->value->int32);
@@ -1187,6 +1233,8 @@ static void load_persisted(void) {
     s_temp[i] = persist_exists(PERSIST_TEMP(i)) ? persist_read_int(PERSIST_TEMP(i)) : NO_TEMP;
     s_code[i] = persist_exists(PERSIST_CODE(i)) ? persist_read_int(PERSIST_CODE(i)) : -1;
   }
+  s_sunrise = persist_exists(PERSIST_SUNRISE) ? persist_read_int(PERSIST_SUNRISE) : 0;
+  s_sunset = persist_exists(PERSIST_SUNSET) ? persist_read_int(PERSIST_SUNSET) : 0;
   for (int p = 0; p < 2; p++) {
     s_last_sync[p] = persist_exists(PERSIST_LAST_SYNC(p)) ? persist_read_int(PERSIST_LAST_SYNC(p)) : 0;
   }

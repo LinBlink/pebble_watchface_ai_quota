@@ -676,6 +676,12 @@ function buildWeatherMessage(data) {
       }
     }
   }
+  var daily = data.daily;
+  if (daily && daily.sunrise && daily.sunrise.length &&
+      daily.sunset && daily.sunset.length) {
+    msg.WX_SUNRISE = Math.floor(daily.sunrise[0]);
+    msg.WX_SUNSET = Math.floor(daily.sunset[0]);
+  }
   return msg;
 }
 
@@ -685,7 +691,7 @@ function fetchWeather(lat, lon) {
             '?latitude=' + lat + '&longitude=' + lon +
             '&current=temperature_2m,weather_code' +
             '&hourly=temperature_2m,weather_code' +
-            '&forecast_days=3&timeformat=unixtime&timezone=UTC' +
+            '&daily=sunrise,sunset&forecast_days=3&timeformat=unixtime&timezone=auto' +
             '&temperature_unit=' + cfg.units;
   getJSON(url, {}, function (data) { send(buildWeatherMessage(data)); });
 }

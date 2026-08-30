@@ -32,6 +32,8 @@
       "WX_CODE_6H",
       "WX_TEMP_24H",
       "WX_CODE_24H",
+      "WX_SUNRISE",
+      "WX_SUNSET",
       "REQUEST_REFRESH",
       "TARGET_DATE",
       "THEME",
