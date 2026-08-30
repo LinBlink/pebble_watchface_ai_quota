@@ -806,7 +806,7 @@ function configPage(cfg, codexConnected, codexPending) {
     '<fieldset><legend>Bank balance</legend>' +
     '<p style="margin:0 0 10px">Enter the current CMB balance once to reset its ' +
     'baseline. Future CMB income/expense notifications adjust it automatically. ' +
-    'BANK shows the total of known Bank of Nanjing and CMB balances.</p>' +
+    'The watch cycles NJ_BANK, ZS_BANK, GS_BANK and their SUM.</p>' +
     '<label>CMB current balance (CNY)</label>' +
     '<input id="cmbBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
     '</fieldset>' +

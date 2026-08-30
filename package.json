@@ -46,7 +46,9 @@
       "CMB_BALANCE_CENTS",
       "CMB_BALANCE_DELTA_CENTS",
       "CMB_EVENT_ID",
-      "CMB_EVENT_AT"
+      "CMB_EVENT_AT",
+      "ICBC_BALANCE_CENTS",
+      "ICBC_UPDATED_AT"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {

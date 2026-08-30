@@ -56,6 +56,8 @@ static const RowSpec ROWS[ROW_COUNT] = {
 #define PERSIST_CMB_UPDATED    555
 #define PERSIST_CMB_BASELINE_AT 556
 #define PERSIST_CMB_EVENT_INDEX 557
+#define PERSIST_ICBC_BALANCE   558
+#define PERSIST_ICBC_UPDATED   559
 #define CMB_EVENT_HISTORY      16
 #define PERSIST_CMB_EVENT(i)   (560 + (i))
 
@@ -112,6 +114,9 @@ static int32_t s_cmb_updated;
 static int32_t s_cmb_baseline_at;     // ignore notifications at/before calibration
 static int32_t s_cmb_event_ids[CMB_EVENT_HISTORY];
 static int32_t s_cmb_event_index;
+static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
+static int32_t s_icbc_updated;
+static int s_bank_display_index;     // NJ, CMB, ICBC, then total
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -171,6 +176,7 @@ static TextLayer *s_wx_temp_layers[WX_COUNT];
 static Layer *s_wx_icons_layer;
 static TextLayer *s_bank_meta_layer;
 static TextLayer *s_bank_balance_layer;
+static AppTimer *s_bank_timer;
 static TextLayer *s_separators[3];
 static Layer *s_status_layer;
 static Layer *s_rows_layer;
@@ -507,34 +513,63 @@ static void update_weather(void) {
 }
 
 static void update_bank(void) {
-  text_layer_set_text(s_bank_meta_layer, "BANK");
-
+  static const char *labels[] = { "NJ_BANK", "ZS_BANK", "GS_BANK", "SUM" };
+  int32_t balance = -1;
+  int32_t updated = 0;
   int known = 0;
   int64_t total = 0;
-  if (s_bank_balance_cents >= 0) {
-    total += s_bank_balance_cents;
-    known++;
-  }
-  if (s_cmb_balance_cents >= 0) {
-    total += s_cmb_balance_cents;
-    known++;
+
+  text_layer_set_text(s_bank_meta_layer, labels[s_bank_display_index]);
+  if (s_bank_display_index == 0) {
+    balance = s_bank_balance_cents;
+    updated = s_bank_updated;
+  } else if (s_bank_display_index == 1) {
+    balance = s_cmb_balance_cents;
+    updated = s_cmb_updated;
+  } else if (s_bank_display_index == 2) {
+    balance = s_icbc_balance_cents;
+    updated = s_icbc_updated;
+  } else {
+    if (s_bank_balance_cents >= 0) {
+      total += s_bank_balance_cents;
+      known++;
+      if (s_bank_updated > updated) updated = s_bank_updated;
+    }
+    if (s_cmb_balance_cents >= 0) {
+      total += s_cmb_balance_cents;
+      known++;
+      if (s_cmb_updated > updated) updated = s_cmb_updated;
+    }
+    if (s_icbc_balance_cents >= 0) {
+      total += s_icbc_balance_cents;
+      known++;
+      if (s_icbc_updated > updated) updated = s_icbc_updated;
+    }
+    if (known) balance = 0; // SUM is formatted from the wider total below.
   }
 
-  if (!known) {
+  if (balance < 0 && !(s_bank_display_index == 1 && s_cmb_balance_cents < 0)) {
     snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
   } else {
-    bool negative = total < 0;
-    uint64_t absolute = negative ? (uint64_t)(-total) : (uint64_t)total;
+    int64_t value = s_bank_display_index == 3 ? total : balance;
+    bool negative = value < 0;
+    uint64_t absolute = negative ? (uint64_t)(-value) : (uint64_t)value;
     snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "%s¥%lu.%02lu",
              negative ? "-" : "", (unsigned long)(absolute / 100),
              (unsigned long)(absolute % 100));
   }
   text_layer_set_text(s_bank_balance_layer, s_bank_balance_buf);
 
-  int32_t newest = s_bank_updated > s_cmb_updated ? s_bank_updated : s_cmb_updated;
-  bool stale = newest <= 0 || (int32_t)time(NULL) - newest > 24 * 60 * 60;
+  bool stale = updated <= 0 || (int32_t)time(NULL) - updated > 24 * 60 * 60;
   text_layer_set_text_color(s_bank_balance_layer,
                             stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
+}
+
+static void bank_timer_handler(void *context) {
+  s_bank_timer = NULL;
+  s_bank_display_index = (s_bank_display_index + 1) % 4;
+  update_bank();
+  s_bank_timer = app_timer_register(500, bank_timer_handler, NULL);
 }
 
 // Minutes until the next 22:00 local, which is what the countdown line shows.
@@ -944,6 +979,16 @@ static void inbox_received(DictionaryIterator *it, void *context) {
     }
   }
 
+  Tuple *icbc_balance = dict_find(it, MESSAGE_KEY_ICBC_BALANCE_CENTS);
+  Tuple *icbc_updated = dict_find(it, MESSAGE_KEY_ICBC_UPDATED_AT);
+  if (icbc_balance && icbc_updated &&
+      icbc_updated->value->int32 >= s_icbc_updated) {
+    store_int(PERSIST_ICBC_BALANCE, &s_icbc_balance_cents,
+              icbc_balance->value->int32);
+    store_int(PERSIST_ICBC_UPDATED, &s_icbc_updated,
+              icbc_updated->value->int32);
+  }
+
   apply_weather(it, MESSAGE_KEY_WX_TEMP_NOW, MESSAGE_KEY_WX_CODE_NOW, 0);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_6H, MESSAGE_KEY_WX_CODE_6H, 1);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_24H, MESSAGE_KEY_WX_CODE_24H, 2);
@@ -1030,6 +1075,10 @@ static void load_persisted(void) {
     s_cmb_event_ids[i] = persist_exists(PERSIST_CMB_EVENT(i))
                            ? persist_read_int(PERSIST_CMB_EVENT(i)) : 0;
   }
+  s_icbc_balance_cents = persist_exists(PERSIST_ICBC_BALANCE)
+                           ? persist_read_int(PERSIST_ICBC_BALANCE) : -1;
+  s_icbc_updated = persist_exists(PERSIST_ICBC_UPDATED)
+                     ? persist_read_int(PERSIST_ICBC_UPDATED) : 0;
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
     s_reset_alerted[i] = persist_exists(PERSIST_RESET_ALERTED(i)) &&
@@ -1154,9 +1203,14 @@ static void window_load(Window *window) {
   }
 
   update_ui();
+  s_bank_timer = app_timer_register(500, bank_timer_handler, NULL);
 }
 
 static void window_unload(Window *window) {
+  if (s_bank_timer) {
+    app_timer_cancel(s_bank_timer);
+    s_bank_timer = NULL;
+  }
   for (int i = 0; i < ROW_COUNT; i++) {
     text_layer_destroy(s_label_layers[i]);
     text_layer_destroy(s_pct_layers[i]);
