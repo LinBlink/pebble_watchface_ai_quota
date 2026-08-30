@@ -228,7 +228,7 @@ static void update_date(struct tm *t);
 #define CORNER_H      16
 
 #define DATE_Y        36
-#define DATE_LUNAR_Y  42
+#define DATE_LUNAR_Y  39
 #define DATE_H        20
 #define DATE_X        3
 #define DATE_W        90
