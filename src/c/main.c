@@ -120,9 +120,6 @@ static int32_t s_cmb_event_ids[CMB_EVENT_HISTORY];
 static int32_t s_cmb_event_index;
 static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
-static int s_bank_display_index;     // NJ, CMB, ICBC, then total
-static bool s_show_lunar;
-static bool s_show_sun_times;
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -173,8 +170,6 @@ static const Theme THEMES[2] = {
 
 static Window *s_window;
 static GFont s_consolas_font;          // loaded at window_load, freed at unload
-static GFont s_bank_font;              // compact Chinese bank labels
-static GFont s_lunar_font;             // compact Chinese lunar date
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
@@ -182,12 +177,7 @@ static TextLayer *s_birthday_layer;
 static TextLayer *s_dday_layer;
 static TextLayer *s_wx_temp_layers[WX_COUNT];
 static Layer *s_wx_icons_layer;
-static TextLayer *s_bank_meta_layer;
-static TextLayer *s_bank_balance_layer;
-static TextLayer *s_bank_sum_layer;
-static AppTimer *s_bank_timer;
-static AppTimer *s_date_timer;
-static AppTimer *s_weather_timer;
+static TextLayer *s_bank_layers[WX_COUNT];
 static TextLayer *s_separators[3];
 static Layer *s_status_layer;
 static Layer *s_rows_layer;
@@ -201,22 +191,11 @@ static char s_countdown_buf[10];
 static char s_birthday_buf[12];
 static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
-static char s_sunrise_buf[12];
-static char s_sunset_buf[12];
-static char s_bank_balance_buf[20];
-static char s_bank_sum_buf[20];
+static char s_bank_buf[WX_COUNT][12];
 static char s_pct_buf[ROW_COUNT][12];
 static char s_reset_buf[ROW_COUNT][12];
-static uint32_t s_whimsy;
 
 static void update_date(struct tm *t);
-
-// A tiny deterministic bit of whimsy keeps independent panels from marching
-// in lockstep while staying close enough to a one-second cadence.
-static uint32_t next_whimsy_delay(void) {
-  s_whimsy = s_whimsy * 1664525u + 1013904223u;
-  return 850 + (s_whimsy % 301);  // 0.85–1.15 seconds
-}
 
 // ------------------------------------------------------------------- layout
 
@@ -261,17 +240,11 @@ static uint32_t next_whimsy_delay(void) {
 #define WX_TEMP_X     20
 #define WX_TEMP_W     28
 #define WX_TEMP_H     20
-#define SUN_COL_W      (SCREEN_W / 2)
 #define SEP_WX_Y      78
 
 #define BANK_Y        79
 #define BANK_H        20
-#define BANK_META_X   3
-#define BANK_META_W   40
-#define BANK_VALUE_X  43
-#define BANK_VALUE_W  42
-#define BANK_SUM_X    87
-#define BANK_SUM_W    54
+#define BANK_COL_W    (SCREEN_W / WX_COUNT)
 #define SEP2_Y        99
 
 // 17px per row leaves 15px of text above a 2px bar. The text sits 1px high of
@@ -378,7 +351,6 @@ static void draw_small_wx_icon(GContext *ctx, int x, WxIcon icon) {
 }
 
 static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
-  if (s_show_sun_times) return;
   for (int i = 0; i < WX_COUNT; i++) {
     WxIcon icon = s_temp[i] == NO_TEMP ? WX_UNKNOWN : wmo_icon(s_code[i]);
     draw_small_wx_icon(ctx, i * WX_COL_W, icon);
@@ -508,33 +480,6 @@ static void update_rows(time_t now) {
 }
 
 static void update_weather(void) {
-  if (s_show_sun_times) {
-    if (s_sunrise > 0) {
-      time_t sunrise_at = s_sunrise;
-      struct tm *sunrise = localtime(&sunrise_at);
-      strftime(s_sunrise_buf, sizeof(s_sunrise_buf), "UP %H:%M", sunrise);
-    } else {
-      snprintf(s_sunrise_buf, sizeof(s_sunrise_buf), "UP --:--");
-    }
-    if (s_sunset > 0) {
-      time_t sunset_at = s_sunset;
-      struct tm *sunset = localtime(&sunset_at);
-      strftime(s_sunset_buf, sizeof(s_sunset_buf), "DN %H:%M", sunset);
-    } else {
-      snprintf(s_sunset_buf, sizeof(s_sunset_buf), "DN --:--");
-    }
-    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[0]),
-                    GRect(0, WX_Y, SUN_COL_W, WX_TEMP_H));
-    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[1]),
-                    GRect(SUN_COL_W, WX_Y, SUN_COL_W, WX_TEMP_H));
-    text_layer_set_text_alignment(s_wx_temp_layers[0], GTextAlignmentCenter);
-    text_layer_set_text_alignment(s_wx_temp_layers[1], GTextAlignmentCenter);
-    text_layer_set_text(s_wx_temp_layers[0], s_sunrise_buf);
-    text_layer_set_text(s_wx_temp_layers[1], s_sunset_buf);
-    text_layer_set_text(s_wx_temp_layers[2], "");
-    layer_mark_dirty(s_wx_icons_layer);
-    return;
-  }
   for (int i = 0; i < WX_COUNT; i++) {
     if (s_temp[i] == NO_TEMP) {
       snprintf(s_wx_temp_buf[i], sizeof(s_wx_temp_buf[i]), "--");
@@ -565,87 +510,27 @@ static void format_bank_balance(char *buf, size_t size, int64_t cents) {
 }
 
 static void update_bank(void) {
-  static const char *labels[] = { "南京银行", "招商银行", "工商银行" };
-  int32_t balance = -1;
-  int32_t updated = 0;
-  bool has_balance = false;
-  int known = 0;
-  int64_t total = 0;
+  const int32_t balances[WX_COUNT] = {
+    s_icbc_balance_cents, s_cmb_balance_cents, s_bank_balance_cents
+  };
+  const int32_t updated[WX_COUNT] = {
+    s_icbc_updated, s_cmb_updated, s_bank_updated
+  };
+  const bool available[WX_COUNT] = {
+    s_icbc_updated > 0, s_cmb_baseline_at > 0, s_bank_updated > 0
+  };
 
-  text_layer_set_text(s_bank_meta_layer, labels[s_bank_display_index]);
-  if (s_bank_display_index == 0) {
-    balance = s_bank_balance_cents;
-    updated = s_bank_updated;
-    has_balance = updated > 0;
-  } else if (s_bank_display_index == 1) {
-    balance = s_cmb_balance_cents;
-    updated = s_cmb_updated;
-    has_balance = s_cmb_baseline_at > 0;
-  } else if (s_bank_display_index == 2) {
-    balance = s_icbc_balance_cents;
-    updated = s_icbc_updated;
-    has_balance = updated > 0;
+  for (int i = 0; i < WX_COUNT; i++) {
+    if (available[i]) {
+      format_bank_balance(s_bank_buf[i], sizeof(s_bank_buf[i]), balances[i]);
+    } else {
+      snprintf(s_bank_buf[i], sizeof(s_bank_buf[i]), "--");
+    }
+    text_layer_set_text(s_bank_layers[i], s_bank_buf[i]);
+    bool stale = updated[i] <= 0 || (int32_t)time(NULL) - updated[i] > 24 * 60 * 60;
+    text_layer_set_text_color(s_bank_layers[i],
+                              stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
   }
-
-  if (s_bank_updated > 0) {
-    total += s_bank_balance_cents;
-    known++;
-  }
-  if (s_cmb_baseline_at > 0) {
-    total += s_cmb_balance_cents;
-    known++;
-  }
-  if (s_icbc_updated > 0) {
-    total += s_icbc_balance_cents;
-    known++;
-  }
-
-  if (!has_balance) {
-    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
-  } else {
-    int64_t value = s_bank_display_index == 3 ? total : balance;
-    format_bank_balance(s_bank_balance_buf, sizeof(s_bank_balance_buf), value);
-  }
-  text_layer_set_text(s_bank_balance_layer, s_bank_balance_buf);
-
-  bool stale = updated <= 0 || (int32_t)time(NULL) - updated > 24 * 60 * 60;
-  text_layer_set_text_color(s_bank_balance_layer,
-                            stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
-
-  if (known) {
-    format_bank_balance(s_bank_sum_buf, sizeof(s_bank_sum_buf), total);
-  } else {
-    snprintf(s_bank_sum_buf, sizeof(s_bank_sum_buf), "--");
-  }
-  text_layer_set_text(s_bank_sum_layer, s_bank_sum_buf);
-  int32_t newest = s_bank_updated;
-  if (s_cmb_updated > newest) newest = s_cmb_updated;
-  if (s_icbc_updated > newest) newest = s_icbc_updated;
-  stale = newest <= 0 || (int32_t)time(NULL) - newest > 24 * 60 * 60;
-  text_layer_set_text_color(s_bank_sum_layer,
-                            stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
-}
-
-static void bank_timer_handler(void *context) {
-  s_bank_timer = NULL;
-  s_bank_display_index = (s_bank_display_index + 1) % 3;
-  update_bank();
-  s_bank_timer = app_timer_register(next_whimsy_delay(), bank_timer_handler, NULL);
-}
-
-static void date_timer_handler(void *context) {
-  s_date_timer = NULL;
-  s_show_lunar = !s_show_lunar;
-  time_t now = time(NULL);
-  update_date(localtime(&now));
-  s_date_timer = app_timer_register(next_whimsy_delay(), date_timer_handler, NULL);
-}
-
-static void weather_timer_handler(void *context) {
-  s_weather_timer = NULL;
-  s_show_sun_times = !s_show_sun_times;
-  update_weather();
-  s_weather_timer = app_timer_register(next_whimsy_delay(), weather_timer_handler, NULL);
 }
 
 // Minutes until the next 22:00 local, which is what the countdown line shows.
@@ -665,101 +550,8 @@ static time_t local_midnight(time_t t) {
   return mktime(&tm);
 }
 
-// Lunar data for 2000-2039. The watch only needs the compact month/day label;
-// dates outside this small table fall back to the Gregorian display.
-static const uint32_t LUNAR_INFO[] = {
-  0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0,
-  0x092d0, 0x0cab5, 0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0,
-  0x0a5b0, 0x15176, 0x052b0, 0x0a930, 0x07954, 0x06aa0, 0x0ad50, 0x05b52,
-  0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530, 0x05aa0, 0x076a3,
-  0x096d0, 0x04afb, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45
-};
-
-static int lunar_leap_month(int year) {
-  return LUNAR_INFO[year - 2000] & 0xf;
-}
-
-static int lunar_leap_days(int year) {
-  uint32_t info = LUNAR_INFO[year - 2000];
-  return lunar_leap_month(year) ? ((info & 0x10000) ? 30 : 29) : 0;
-}
-
-static int lunar_month_days(int year, int month) {
-  return (LUNAR_INFO[year - 2000] & (0x10000 >> month)) ? 30 : 29;
-}
-
-static int lunar_year_days(int year) {
-  int days = 348;
-  uint32_t info = LUNAR_INFO[year - 2000];
-  for (uint32_t mask = 0x8000; mask > 0x8; mask >>= 1)
-    if (info & mask) days++;
-  return days + lunar_leap_days(year);
-}
-
-static void format_lunar_date(struct tm *t) {
-#if 0
-  static const char *months[] = {
-    "", "正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"
-  };
-  static const char *days[] = {
-    "", "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
-    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "廿",
-    "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十"
-  };
-#endif
-  int year = t->tm_year + 1900;
-  // 2000-02-05 is lunar 2000-01-01.
-  int offset = -35;
-  if (year < 2000 || year >= 2040) {
-    snprintf(s_date_buf, sizeof(s_date_buf), "--");
-    return;
-  }
-  for (int y = 2000; y < year; y++) {
-    offset += (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 366 : 365;
-  }
-  static const int month_days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
-  for (int m = 1; m < t->tm_mon + 1; m++) {
-    offset += month_days[m - 1];
-    if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) offset++;
-  }
-  offset += t->tm_mday - 1;
-  int lunar_year = 2000;
-  while (lunar_year < 2039 && offset >= lunar_year_days(lunar_year)) {
-    offset -= lunar_year_days(lunar_year++);
-  }
-  int lunar_month = 1;
-  bool leap = false;
-  while (lunar_month <= 12) {
-    int days_in_month = leap ? lunar_leap_days(lunar_year)
-                             : lunar_month_days(lunar_year, lunar_month);
-    if (offset < days_in_month) break;
-    offset -= days_in_month;
-    if (lunar_leap_month(lunar_year) == lunar_month && !leap) {
-      leap = true;
-    } else {
-      if (leap) leap = false;
-      lunar_month++;
-    }
-  }
-  int lunar_day = offset + 1;
-  // Use a compact numeric label here: Pebble's small Chinese font can clip
-  // repeated edge glyphs in a four-character lunar date.
-  snprintf(s_date_buf, sizeof(s_date_buf), "L%02d-%02d",
-           lunar_month, lunar_day);
-}
-
 static void update_date(struct tm *t) {
-  if (s_show_lunar) {
-    format_lunar_date(t);
-    text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-    layer_set_frame(text_layer_get_layer(s_date_layer),
-                    GRect(DATE_X, DATE_Y, DATE_W, DATE_H));
-  } else {
-    strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
-    text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-    layer_set_frame(text_layer_get_layer(s_date_layer),
-                    GRect(DATE_X, DATE_Y, DATE_W, DATE_H));
-  }
+  strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
   text_layer_set_text(s_date_layer, s_date_buf);
 }
 
@@ -993,8 +785,8 @@ static void apply_theme(void) {
 
   for (int i = 0; i < WX_COUNT; i++)
     text_layer_set_text_color(s_wx_temp_layers[i], t->fg);
-  text_layer_set_text_color(s_bank_meta_layer, t->fg_dim);
-  text_layer_set_text_color(s_bank_sum_layer, t->fg);
+  for (int i = 0; i < WX_COUNT; i++)
+    text_layer_set_text_color(s_bank_layers[i], t->fg);
 
   text_layer_set_background_color(s_separators[0], t->separator);
   text_layer_set_background_color(s_separators[1], t->separator);
@@ -1320,9 +1112,6 @@ static void window_load(Window *window) {
   window_set_background_color(window, THEMES[s_theme].bg);
 
   s_consolas_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_CONSOLAS_38));
-  s_bank_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_BANK_LABELS_11));
-  s_lunar_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_LUNAR_LABELS_11));
-
   s_time_layer = make_text(root, GRect(0, TIME_Y, SCREEN_W, TIME_H),
                            time_font(), GTextAlignmentCenter, THEMES[s_theme].fg);
 
@@ -1374,24 +1163,13 @@ static void window_load(Window *window) {
 
   s_separators[1] = separator(root, SEP_WX_Y);
 
-  s_bank_meta_layer = make_text(root,
-                                GRect(BANK_META_X, BANK_Y + 3, BANK_META_W, BANK_H),
-                                s_bank_font,
-                                GTextAlignmentLeft, THEMES[s_theme].fg_dim);
-  text_layer_set_text(s_bank_meta_layer, "南京银行");
-
-  s_bank_balance_layer = make_text(root,
-                                   GRect(BANK_VALUE_X, BANK_Y - 2,
-                                         BANK_VALUE_W, BANK_H + 3),
-                                   fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                                   GTextAlignmentRight, THEMES[s_theme].fg);
-  text_layer_set_text(s_bank_balance_layer, "--");
-
-  s_bank_sum_layer = make_text(root,
-                               GRect(BANK_SUM_X, BANK_Y - 2, BANK_SUM_W, BANK_H + 3),
-                               fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                               GTextAlignmentRight, THEMES[s_theme].fg);
-  text_layer_set_text(s_bank_sum_layer, "--");
+  for (int i = 0; i < WX_COUNT; i++) {
+    s_bank_layers[i] = make_text(root,
+                                 GRect(i * BANK_COL_W, BANK_Y, BANK_COL_W, BANK_H),
+                                 fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                                 GTextAlignmentCenter, THEMES[s_theme].fg);
+    text_layer_set_text(s_bank_layers[i], "--");
+  }
 
   s_separators[2] = separator(root, SEP2_Y);
 
@@ -1421,25 +1199,9 @@ static void window_load(Window *window) {
   }
 
   update_ui();
-  s_whimsy = (uint32_t)time(NULL) ^ 0xa1c0deu;
-  s_bank_timer = app_timer_register(next_whimsy_delay(), bank_timer_handler, NULL);
-  s_date_timer = app_timer_register(next_whimsy_delay(), date_timer_handler, NULL);
-  s_weather_timer = app_timer_register(next_whimsy_delay(), weather_timer_handler, NULL);
 }
 
 static void window_unload(Window *window) {
-  if (s_bank_timer) {
-    app_timer_cancel(s_bank_timer);
-    s_bank_timer = NULL;
-  }
-  if (s_date_timer) {
-    app_timer_cancel(s_date_timer);
-    s_date_timer = NULL;
-  }
-  if (s_weather_timer) {
-    app_timer_cancel(s_weather_timer);
-    s_weather_timer = NULL;
-  }
   for (int i = 0; i < ROW_COUNT; i++) {
     text_layer_destroy(s_label_layers[i]);
     text_layer_destroy(s_pct_layers[i]);
@@ -1449,11 +1211,9 @@ static void window_unload(Window *window) {
     text_layer_destroy(s_wx_temp_layers[i]);
   }
   layer_destroy(s_wx_icons_layer);
-  text_layer_destroy(s_bank_meta_layer);
-  text_layer_destroy(s_bank_balance_layer);
-  text_layer_destroy(s_bank_sum_layer);
-  fonts_unload_custom_font(s_lunar_font);
-  fonts_unload_custom_font(s_bank_font);
+  for (int i = 0; i < WX_COUNT; i++) {
+    text_layer_destroy(s_bank_layers[i]);
+  }
   fonts_unload_custom_font(s_consolas_font);
   layer_destroy(s_rows_layer);
   layer_destroy(s_status_layer);
