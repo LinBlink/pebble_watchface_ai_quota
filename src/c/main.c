@@ -635,6 +635,7 @@ static int lunar_year_days(int year) {
 }
 
 static void format_lunar_date(struct tm *t) {
+#if 0
   static const char *months[] = {
     "", "正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"
   };
@@ -643,6 +644,7 @@ static void format_lunar_date(struct tm *t) {
     "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "廿",
     "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十"
   };
+#endif
   int year = t->tm_year + 1900;
   // 2000-02-05 is lunar 2000-01-01.
   int offset = -35;
@@ -650,7 +652,9 @@ static void format_lunar_date(struct tm *t) {
     snprintf(s_date_buf, sizeof(s_date_buf), "--");
     return;
   }
-  for (int y = 2000; y < year; y++) offset += lunar_year_days(y);
+  for (int y = 2000; y < year; y++) {
+    offset += (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 ? 366 : 365;
+  }
   static const int month_days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
   for (int m = 1; m < t->tm_mon + 1; m++) {
     offset += month_days[m - 1];
