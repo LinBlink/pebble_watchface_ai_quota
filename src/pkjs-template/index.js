@@ -454,6 +454,23 @@ function merge(into, from) {
   return into;
 }
 
+// One-time CMB calibration. Keep this field out of saved settings: sending an
+// old baseline again on every companion restart would erase notification
+// deltas that the watch has already applied.
+function cmbBalanceMessage(text) {
+  text = (text || '').trim().replace(/,/g, '');
+  var m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
+  if (!m) return {};
+  var whole = Number(m[1]);
+  var fraction = (m[2] || '') + '00';
+  var cents = whole * 100 + Number(fraction.substring(0, 2));
+  if (!isFinite(cents) || cents < 0 || cents > 2147483647) return {};
+  return {
+    CMB_BALANCE_CENTS: Math.round(cents),
+    CMB_EVENT_AT: Math.floor(Date.now() / 1000)
+  };
+}
+
 // --- chatgpt codex, direct
 
 function codexWindowMessage(win) {
@@ -786,6 +803,13 @@ function configPage(cfg, codexConnected, codexPending) {
     '<label>7-day used %</label><input id="codex7pct" type="number" min="0" max="100" placeholder="e.g. 61">' +
     '<label>7-day time left</label><input id="codex7d" placeholder="e.g. 2d8h">' +
     '</fieldset>' +
+    '<fieldset><legend>Bank balance</legend>' +
+    '<p style="margin:0 0 10px">Enter the current CMB balance once to reset its ' +
+    'baseline. Future CMB income/expense notifications adjust it automatically. ' +
+    'BANK shows the total of known Bank of Nanjing and CMB balances.</p>' +
+    '<label>CMB current balance (CNY)</label>' +
+    '<input id="cmbBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
+    '</fieldset>' +
     '<label>Countdown target date (blank = hide)</label>' +
     '<input id="targetDate" type="date" value="' + cfg.targetDate + '">' +
     '<label>Weather latitude (blank = phone GPS)</label>' +
@@ -816,6 +840,7 @@ function configPage(cfg, codexConnected, codexPending) {
     'theme:g("theme"),timeFont:g("timeFont"),aiProvider:g("aiProvider"),' +
     'claude7d:g("claude7d"),' +
     'codex7pct:g("codex7pct"),codex7d:g("codex7d"),' +
+    'cmbBalance:g("cmbBalance"),' +
     'codexStart:codexStart,codexClear:codexClear}}' +
     'function saveAndClose(){location.href="pebblejs://close#"+' +
     'encodeURIComponent(JSON.stringify(formResult()))}' +
@@ -851,9 +876,11 @@ Pebble.addEventListener('webviewclosed', function (e) {
     var calibration = claudeCalibrationMessage('', parsed.claude7d);
     merge(calibration, codexCalibrationMessage('', '',
                                                 parsed.codex7pct, parsed.codex7d));
+    var cmbCalibration = cmbBalanceMessage(parsed.cmbBalance);
     delete parsed.claude7d;
     delete parsed.codex7pct;
     delete parsed.codex7d;
+    delete parsed.cmbBalance;
     if (parsed.codexClear) {
       localStorage.removeItem('codex_oauth');
       clearCodexLogin();
@@ -865,6 +892,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
     sendAppearance();
     sendTargetDate();
     send(calibration);
+    send(cmbCalibration);
     refreshQuotas(true);
     refreshWeather();
     if (startCodex) startCodexLogin();

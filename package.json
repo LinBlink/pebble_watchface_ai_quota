@@ -42,7 +42,11 @@
       "BANK_NAME",
       "BANK_CARD_LAST4",
       "BANK_BALANCE_CENTS",
-      "BANK_UPDATED_AT"
+      "BANK_UPDATED_AT",
+      "CMB_BALANCE_CENTS",
+      "CMB_BALANCE_DELTA_CENTS",
+      "CMB_EVENT_ID",
+      "CMB_EVENT_AT"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {

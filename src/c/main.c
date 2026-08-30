@@ -52,6 +52,12 @@ static const RowSpec ROWS[ROW_COUNT] = {
 #define PERSIST_BANK_LAST4     551
 #define PERSIST_BANK_BALANCE   552
 #define PERSIST_BANK_UPDATED   553
+#define PERSIST_CMB_BALANCE    554
+#define PERSIST_CMB_UPDATED    555
+#define PERSIST_CMB_BASELINE_AT 556
+#define PERSIST_CMB_EVENT_INDEX 557
+#define CMB_EVENT_HISTORY      16
+#define PERSIST_CMB_EVENT(i)   (560 + (i))
 
 // Buzz once when a quota first crosses this. Persisted per row so a restart
 // doesn't re-alert, and cleared when the window resets so the next crossing
@@ -101,6 +107,11 @@ static int32_t s_github_sync;         // UTC epoch of last successful GitHub fet
 static int32_t s_github_latest;       // UTC epoch of the most recent visible commit
 static int32_t s_bank_balance_cents;  // integer cents; -1 = no data
 static int32_t s_bank_updated;        // UTC epoch from the SMS parser
+static int32_t s_cmb_balance_cents;   // locally maintained from CMB notifications
+static int32_t s_cmb_updated;
+static int32_t s_cmb_baseline_at;     // ignore notifications at/before calibration
+static int32_t s_cmb_event_ids[CMB_EVENT_HISTORY];
+static int32_t s_cmb_event_index;
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -498,17 +509,30 @@ static void update_weather(void) {
 static void update_bank(void) {
   text_layer_set_text(s_bank_meta_layer, "BANK");
 
-  if (s_bank_balance_cents < 0) {
+  int known = 0;
+  int64_t total = 0;
+  if (s_bank_balance_cents >= 0) {
+    total += s_bank_balance_cents;
+    known++;
+  }
+  if (s_cmb_balance_cents >= 0) {
+    total += s_cmb_balance_cents;
+    known++;
+  }
+
+  if (!known) {
     snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
   } else {
-    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "¥%ld.%02ld",
-             (long)(s_bank_balance_cents / 100),
-             (long)(s_bank_balance_cents % 100));
+    bool negative = total < 0;
+    uint64_t absolute = negative ? (uint64_t)(-total) : (uint64_t)total;
+    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "%s¥%lu.%02lu",
+             negative ? "-" : "", (unsigned long)(absolute / 100),
+             (unsigned long)(absolute % 100));
   }
   text_layer_set_text(s_bank_balance_layer, s_bank_balance_buf);
 
-  bool stale = s_bank_updated <= 0 ||
-               (int32_t)time(NULL) - s_bank_updated > 24 * 60 * 60;
+  int32_t newest = s_bank_updated > s_cmb_updated ? s_bank_updated : s_cmb_updated;
+  bool stale = newest <= 0 || (int32_t)time(NULL) - newest > 24 * 60 * 60;
   text_layer_set_text_color(s_bank_balance_layer,
                             stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
 }
@@ -785,6 +809,21 @@ static void apply_weather(DictionaryIterator *it, uint32_t temp_key, uint32_t co
   if (c) store_int(PERSIST_CODE(idx), &s_code[idx], c->value->int32);
 }
 
+static bool cmb_event_seen(int32_t event_id) {
+  for (int i = 0; i < CMB_EVENT_HISTORY; i++) {
+    if (s_cmb_event_ids[i] == event_id) return true;
+  }
+  return false;
+}
+
+static void remember_cmb_event(int32_t event_id) {
+  int slot = s_cmb_event_index % CMB_EVENT_HISTORY;
+  s_cmb_event_ids[slot] = event_id;
+  persist_write_int(PERSIST_CMB_EVENT(slot), event_id);
+  s_cmb_event_index = (slot + 1) % CMB_EVENT_HISTORY;
+  persist_write_int(PERSIST_CMB_EVENT_INDEX, s_cmb_event_index);
+}
+
 // Ask the phone to fetch right now instead of waiting for its next poll.
 static void request_refresh(void) {
   if (!connection_service_peek_pebble_app_connection()) return;
@@ -881,6 +920,30 @@ static void inbox_received(DictionaryIterator *it, void *context) {
               bank_updated->value->int32);
   }
 
+  Tuple *cmb_balance = dict_find(it, MESSAGE_KEY_CMB_BALANCE_CENTS);
+  Tuple *cmb_delta = dict_find(it, MESSAGE_KEY_CMB_BALANCE_DELTA_CENTS);
+  Tuple *cmb_event_id = dict_find(it, MESSAGE_KEY_CMB_EVENT_ID);
+  Tuple *cmb_event_at = dict_find(it, MESSAGE_KEY_CMB_EVENT_AT);
+  if (cmb_balance) {
+    int32_t at = cmb_event_at ? cmb_event_at->value->int32 : (int32_t)time(NULL);
+    store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents,
+              cmb_balance->value->int32);
+    store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
+    store_int(PERSIST_CMB_BASELINE_AT, &s_cmb_baseline_at, at);
+  } else if (cmb_delta && cmb_event_id && cmb_event_at &&
+             s_cmb_balance_cents >= 0) {
+    int32_t id = cmb_event_id->value->int32;
+    int32_t at = cmb_event_at->value->int32;
+    if (id && at > s_cmb_baseline_at && !cmb_event_seen(id)) {
+      int64_t next = (int64_t)s_cmb_balance_cents + cmb_delta->value->int32;
+      if (next >= INT32_MIN && next <= INT32_MAX) {
+        store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents, (int32_t)next);
+        store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
+        remember_cmb_event(id);
+      }
+    }
+  }
+
   apply_weather(it, MESSAGE_KEY_WX_TEMP_NOW, MESSAGE_KEY_WX_CODE_NOW, 0);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_6H, MESSAGE_KEY_WX_CODE_6H, 1);
   apply_weather(it, MESSAGE_KEY_WX_TEMP_24H, MESSAGE_KEY_WX_CODE_24H, 2);
@@ -955,6 +1018,18 @@ static void load_persisted(void) {
                            ? persist_read_int(PERSIST_BANK_BALANCE) : -1;
   s_bank_updated = persist_exists(PERSIST_BANK_UPDATED)
                      ? persist_read_int(PERSIST_BANK_UPDATED) : 0;
+  s_cmb_balance_cents = persist_exists(PERSIST_CMB_BALANCE)
+                          ? persist_read_int(PERSIST_CMB_BALANCE) : -1;
+  s_cmb_updated = persist_exists(PERSIST_CMB_UPDATED)
+                    ? persist_read_int(PERSIST_CMB_UPDATED) : 0;
+  s_cmb_baseline_at = persist_exists(PERSIST_CMB_BASELINE_AT)
+                        ? persist_read_int(PERSIST_CMB_BASELINE_AT) : 0;
+  s_cmb_event_index = persist_exists(PERSIST_CMB_EVENT_INDEX)
+                        ? persist_read_int(PERSIST_CMB_EVENT_INDEX) : 0;
+  for (int i = 0; i < CMB_EVENT_HISTORY; i++) {
+    s_cmb_event_ids[i] = persist_exists(PERSIST_CMB_EVENT(i))
+                           ? persist_read_int(PERSIST_CMB_EVENT(i)) : 0;
+  }
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
     s_reset_alerted[i] = persist_exists(PERSIST_RESET_ALERTED(i)) &&
