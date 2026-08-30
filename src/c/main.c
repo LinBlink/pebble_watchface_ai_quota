@@ -118,6 +118,12 @@ static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
 static int s_bank_display_index;     // NJ, CMB, ICBC, then total
 
+static const uint32_t BALANCE_VIBE_DURATIONS[] = { 3000 };
+static const VibePattern BALANCE_CHANGED_VIBE = {
+  .durations = BALANCE_VIBE_DURATIONS,
+  .num_segments = 1,
+};
+
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
 // looks right even before the first AppMessage lands.
@@ -176,6 +182,7 @@ static TextLayer *s_wx_temp_layers[WX_COUNT];
 static Layer *s_wx_icons_layer;
 static TextLayer *s_bank_meta_layer;
 static TextLayer *s_bank_balance_layer;
+static TextLayer *s_bank_sum_layer;
 static AppTimer *s_bank_timer;
 static TextLayer *s_separators[3];
 static Layer *s_status_layer;
@@ -239,9 +246,11 @@ static char s_reset_buf[ROW_COUNT][12];
 #define BANK_Y        79
 #define BANK_H        20
 #define BANK_META_X   3
-#define BANK_META_W   54
-#define BANK_VALUE_X  55
-#define BANK_VALUE_W  86
+#define BANK_META_W   24
+#define BANK_VALUE_X  27
+#define BANK_VALUE_W  58
+#define BANK_SUM_X    87
+#define BANK_SUM_W    54
 #define SEP2_Y        99
 
 // 17px per row leaves 15px of text above a 2px bar. The text sits 1px high of
@@ -512,10 +521,26 @@ static void update_weather(void) {
   layer_mark_dirty(s_wx_icons_layer);
 }
 
+static void format_bank_balance(char *buf, size_t size, int64_t cents) {
+  bool negative = cents < 0;
+  uint64_t absolute = negative ? (uint64_t)(-cents) : (uint64_t)cents;
+  if (absolute >= 100000) {
+    uint64_t hundredths_k = (absolute + 500) / 1000;
+    snprintf(buf, size, "%s%lu.%02luK", negative ? "-" : "",
+             (unsigned long)(hundredths_k / 100),
+             (unsigned long)(hundredths_k % 100));
+  } else {
+    snprintf(buf, size, "%s%lu.%02lu", negative ? "-" : "",
+             (unsigned long)(absolute / 100),
+             (unsigned long)(absolute % 100));
+  }
+}
+
 static void update_bank(void) {
-  static const char *labels[] = { "NJ_BANK", "ZS_BANK", "GS_BANK", "SUM" };
+  static const char *labels[] = { "NJ", "ZS", "GS" };
   int32_t balance = -1;
   int32_t updated = 0;
+  bool has_balance = false;
   int known = 0;
   int64_t total = 0;
 
@@ -523,53 +548,61 @@ static void update_bank(void) {
   if (s_bank_display_index == 0) {
     balance = s_bank_balance_cents;
     updated = s_bank_updated;
+    has_balance = updated > 0;
   } else if (s_bank_display_index == 1) {
     balance = s_cmb_balance_cents;
     updated = s_cmb_updated;
+    has_balance = s_cmb_baseline_at > 0;
   } else if (s_bank_display_index == 2) {
     balance = s_icbc_balance_cents;
     updated = s_icbc_updated;
-  } else {
-    if (s_bank_balance_cents >= 0) {
-      total += s_bank_balance_cents;
-      known++;
-      if (s_bank_updated > updated) updated = s_bank_updated;
-    }
-    if (s_cmb_balance_cents >= 0) {
-      total += s_cmb_balance_cents;
-      known++;
-      if (s_cmb_updated > updated) updated = s_cmb_updated;
-    }
-    if (s_icbc_balance_cents >= 0) {
-      total += s_icbc_balance_cents;
-      known++;
-      if (s_icbc_updated > updated) updated = s_icbc_updated;
-    }
-    if (known) balance = 0; // SUM is formatted from the wider total below.
+    has_balance = updated > 0;
   }
 
-  if (balance < 0 && !(s_bank_display_index == 1 && s_cmb_balance_cents < 0)) {
+  if (s_bank_updated > 0) {
+    total += s_bank_balance_cents;
+    known++;
+  }
+  if (s_cmb_baseline_at > 0) {
+    total += s_cmb_balance_cents;
+    known++;
+  }
+  if (s_icbc_updated > 0) {
+    total += s_icbc_balance_cents;
+    known++;
+  }
+
+  if (!has_balance) {
     snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
   } else {
     int64_t value = s_bank_display_index == 3 ? total : balance;
-    bool negative = value < 0;
-    uint64_t absolute = negative ? (uint64_t)(-value) : (uint64_t)value;
-    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "%s¥%lu.%02lu",
-             negative ? "-" : "", (unsigned long)(absolute / 100),
-             (unsigned long)(absolute % 100));
+    format_bank_balance(s_bank_balance_buf, sizeof(s_bank_balance_buf), value);
   }
   text_layer_set_text(s_bank_balance_layer, s_bank_balance_buf);
 
   bool stale = updated <= 0 || (int32_t)time(NULL) - updated > 24 * 60 * 60;
   text_layer_set_text_color(s_bank_balance_layer,
                             stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
+
+  if (known) {
+    format_bank_balance(s_bank_balance_buf, sizeof(s_bank_balance_buf), total);
+  } else {
+    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
+  }
+  text_layer_set_text(s_bank_sum_layer, s_bank_balance_buf);
+  int32_t newest = s_bank_updated;
+  if (s_cmb_updated > newest) newest = s_cmb_updated;
+  if (s_icbc_updated > newest) newest = s_icbc_updated;
+  stale = newest <= 0 || (int32_t)time(NULL) - newest > 24 * 60 * 60;
+  text_layer_set_text_color(s_bank_sum_layer,
+                            stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
 }
 
 static void bank_timer_handler(void *context) {
   s_bank_timer = NULL;
-  s_bank_display_index = (s_bank_display_index + 1) % 4;
+  s_bank_display_index = (s_bank_display_index + 1) % 3;
   update_bank();
-  s_bank_timer = app_timer_register(500, bank_timer_handler, NULL);
+  s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
 }
 
 // Minutes until the next 22:00 local, which is what the countdown line shows.
@@ -718,10 +751,18 @@ static void draw_battery(GContext *ctx, int x, int y) {
     fill = GColorGreen;
   }
   int inner = BATT_W - 2;
-  int w = (inner * st.charge_percent) / 100;
+  int w = st.is_charging ? inner : (inner * st.charge_percent) / 100;
   if (w > 0) {
     graphics_context_set_fill_color(ctx, fill);
     graphics_fill_rect(ctx, GRect(x + 1, y + 1, w, BATT_H - 2), 0, GCornerNone);
+  }
+  if (st.is_charging) {
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    graphics_context_set_stroke_width(ctx, 2);
+    graphics_draw_line(ctx, GPoint(x + 12, y + 1), GPoint(x + 8, y + 5));
+    graphics_draw_line(ctx, GPoint(x + 8, y + 5), GPoint(x + 12, y + 5));
+    graphics_draw_line(ctx, GPoint(x + 12, y + 5), GPoint(x + 8, y + 9));
+    graphics_context_set_stroke_width(ctx, 1);
   }
 }
 
@@ -790,6 +831,7 @@ static void apply_theme(void) {
   for (int i = 0; i < WX_COUNT; i++)
     text_layer_set_text_color(s_wx_temp_layers[i], t->fg);
   text_layer_set_text_color(s_bank_meta_layer, t->fg_dim);
+  text_layer_set_text_color(s_bank_sum_layer, t->fg);
 
   text_layer_set_background_color(s_separators[0], t->separator);
   text_layer_set_background_color(s_separators[1], t->separator);
@@ -926,6 +968,7 @@ static void check_reset_alerts(time_t now) {
 }
 
 static void inbox_received(DictionaryIterator *it, void *context) {
+  bool balance_changed = false;
   apply_reset_only(it, MESSAGE_KEY_CLAUDE_5H_RESET, 0);
   apply_reset_only(it, MESSAGE_KEY_CLAUDE_WK_RESET, 1);
   apply_codex_quota(it, MESSAGE_KEY_CODEX_5H_PCT, MESSAGE_KEY_CODEX_5H_RESET, 0);
@@ -945,12 +988,13 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   }
 
   Tuple *bank_balance = dict_find(it, MESSAGE_KEY_BANK_BALANCE_CENTS);
-  if (bank_balance) {
+  Tuple *bank_updated = dict_find(it, MESSAGE_KEY_BANK_UPDATED_AT);
+  if (bank_balance && bank_updated &&
+      bank_updated->value->int32 >= s_bank_updated) {
+    balance_changed = s_bank_updated > 0 &&
+                      s_bank_balance_cents != bank_balance->value->int32;
     store_int(PERSIST_BANK_BALANCE, &s_bank_balance_cents,
               bank_balance->value->int32);
-  }
-  Tuple *bank_updated = dict_find(it, MESSAGE_KEY_BANK_UPDATED_AT);
-  if (bank_updated) {
     store_int(PERSIST_BANK_UPDATED, &s_bank_updated,
               bank_updated->value->int32);
   }
@@ -959,19 +1003,24 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *cmb_delta = dict_find(it, MESSAGE_KEY_CMB_BALANCE_DELTA_CENTS);
   Tuple *cmb_event_id = dict_find(it, MESSAGE_KEY_CMB_EVENT_ID);
   Tuple *cmb_event_at = dict_find(it, MESSAGE_KEY_CMB_EVENT_AT);
-  if (cmb_balance) {
-    int32_t at = cmb_event_at ? cmb_event_at->value->int32 : (int32_t)time(NULL);
+  if (cmb_balance && cmb_event_at &&
+      cmb_event_at->value->int32 >= s_cmb_updated) {
+    int32_t at = cmb_event_at->value->int32;
+    balance_changed = balance_changed ||
+                      (s_cmb_baseline_at > 0 &&
+                       s_cmb_balance_cents != cmb_balance->value->int32);
     store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents,
               cmb_balance->value->int32);
     store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
     store_int(PERSIST_CMB_BASELINE_AT, &s_cmb_baseline_at, at);
   } else if (cmb_delta && cmb_event_id && cmb_event_at &&
-             s_cmb_balance_cents >= 0) {
+             s_cmb_baseline_at > 0) {
     int32_t id = cmb_event_id->value->int32;
     int32_t at = cmb_event_at->value->int32;
     if (id && at > s_cmb_baseline_at && !cmb_event_seen(id)) {
       int64_t next = (int64_t)s_cmb_balance_cents + cmb_delta->value->int32;
       if (next >= INT32_MIN && next <= INT32_MAX) {
+        balance_changed = balance_changed || cmb_delta->value->int32 != 0;
         store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents, (int32_t)next);
         store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
         remember_cmb_event(id);
@@ -983,6 +1032,9 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *icbc_updated = dict_find(it, MESSAGE_KEY_ICBC_UPDATED_AT);
   if (icbc_balance && icbc_updated &&
       icbc_updated->value->int32 >= s_icbc_updated) {
+    balance_changed = balance_changed ||
+                      (s_icbc_updated > 0 &&
+                       s_icbc_balance_cents != icbc_balance->value->int32);
     store_int(PERSIST_ICBC_BALANCE, &s_icbc_balance_cents,
               icbc_balance->value->int32);
     store_int(PERSIST_ICBC_UPDATED, &s_icbc_updated,
@@ -1022,6 +1074,7 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   layer_mark_dirty(s_status_layer);
   check_quota_alerts();
   check_reset_alerts(now);
+  if (balance_changed) vibes_enqueue_custom_pattern(BALANCE_CHANGED_VIBE);
   apply_theme();
   update_ui();
 }
@@ -1169,11 +1222,17 @@ static void window_load(Window *window) {
   text_layer_set_text(s_bank_meta_layer, "BANK");
 
   s_bank_balance_layer = make_text(root,
-                                   GRect(BANK_VALUE_X, BANK_Y - 4,
-                                         BANK_VALUE_W, BANK_H + 7),
-                                   fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                                   GRect(BANK_VALUE_X, BANK_Y - 2,
+                                         BANK_VALUE_W, BANK_H + 3),
+                                   fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
                                    GTextAlignmentRight, THEMES[s_theme].fg);
   text_layer_set_text(s_bank_balance_layer, "--");
+
+  s_bank_sum_layer = make_text(root,
+                               GRect(BANK_SUM_X, BANK_Y - 2, BANK_SUM_W, BANK_H + 3),
+                               fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                               GTextAlignmentRight, THEMES[s_theme].fg);
+  text_layer_set_text(s_bank_sum_layer, "--");
 
   s_separators[2] = separator(root, SEP2_Y);
 
@@ -1203,7 +1262,7 @@ static void window_load(Window *window) {
   }
 
   update_ui();
-  s_bank_timer = app_timer_register(500, bank_timer_handler, NULL);
+  s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
 }
 
 static void window_unload(Window *window) {
@@ -1222,6 +1281,7 @@ static void window_unload(Window *window) {
   layer_destroy(s_wx_icons_layer);
   text_layer_destroy(s_bank_meta_layer);
   text_layer_destroy(s_bank_balance_layer);
+  text_layer_destroy(s_bank_sum_layer);
   fonts_unload_custom_font(s_consolas_font);
   layer_destroy(s_rows_layer);
   layer_destroy(s_status_layer);

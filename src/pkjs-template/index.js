@@ -454,10 +454,9 @@ function merge(into, from) {
   return into;
 }
 
-// One-time CMB calibration. Keep this field out of saved settings: sending an
-// old baseline again on every companion restart would erase notification
-// deltas that the watch has already applied.
-function cmbBalanceMessage(text) {
+// One-time bank calibration. Keep these fields out of saved settings: sending
+// old values again on every companion restart would overwrite newer bank data.
+function bankBalanceMessage(text, balanceKey, timeKey, at) {
   text = (text || '').trim().replace(/,/g, '');
   var m = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
   if (!m) return {};
@@ -465,10 +464,10 @@ function cmbBalanceMessage(text) {
   var fraction = (m[2] || '') + '00';
   var cents = whole * 100 + Number(fraction.substring(0, 2));
   if (!isFinite(cents) || cents < 0 || cents > 2147483647) return {};
-  return {
-    CMB_BALANCE_CENTS: Math.round(cents),
-    CMB_EVENT_AT: Math.floor(Date.now() / 1000)
-  };
+  var message = {};
+  message[balanceKey] = Math.round(cents);
+  message[timeKey] = at;
+  return message;
 }
 
 // --- chatgpt codex, direct
@@ -804,11 +803,15 @@ function configPage(cfg, codexConnected, codexPending) {
     '<label>7-day time left</label><input id="codex7d" placeholder="e.g. 2d8h">' +
     '</fieldset>' +
     '<fieldset><legend>Bank balance</legend>' +
-    '<p style="margin:0 0 10px">Enter the current CMB balance once to reset its ' +
-    'baseline. Future CMB income/expense notifications adjust it automatically. ' +
-    'The watch cycles NJ_BANK, ZS_BANK, GS_BANK and their SUM.</p>' +
-    '<label>CMB current balance (CNY)</label>' +
-    '<input id="cmbBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
+    '<p style="margin:0 0 10px">Blank fields preserve existing values. A value ' +
+    'sets that bank\'s latest baseline; only newer SMS or App notifications can ' +
+    'replace it. The watch cycles NJ, ZS, GS and SUM once per second.</p>' +
+    '<label>NJ current balance (CNY)</label>' +
+    '<input id="njBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
+    '<label>ZS current balance (CNY)</label>' +
+    '<input id="zsBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
+    '<label>GS current balance (CNY)</label>' +
+    '<input id="gsBalance" inputmode="decimal" placeholder="e.g. 1234.56">' +
     '</fieldset>' +
     '<label>Countdown target date (blank = hide)</label>' +
     '<input id="targetDate" type="date" value="' + cfg.targetDate + '">' +
@@ -840,7 +843,7 @@ function configPage(cfg, codexConnected, codexPending) {
     'theme:g("theme"),timeFont:g("timeFont"),aiProvider:g("aiProvider"),' +
     'claude7d:g("claude7d"),' +
     'codex7pct:g("codex7pct"),codex7d:g("codex7d"),' +
-    'cmbBalance:g("cmbBalance"),' +
+    'njBalance:g("njBalance"),zsBalance:g("zsBalance"),gsBalance:g("gsBalance"),' +
     'codexStart:codexStart,codexClear:codexClear}}' +
     'function saveAndClose(){location.href="pebblejs://close#"+' +
     'encodeURIComponent(JSON.stringify(formResult()))}' +
@@ -876,11 +879,23 @@ Pebble.addEventListener('webviewclosed', function (e) {
     var calibration = claudeCalibrationMessage('', parsed.claude7d);
     merge(calibration, codexCalibrationMessage('', '',
                                                 parsed.codex7pct, parsed.codex7d));
-    var cmbCalibration = cmbBalanceMessage(parsed.cmbBalance);
+    var bankCalibration = {};
+    var calibratedAt = Math.floor(Date.now() / 1000);
+    merge(bankCalibration, bankBalanceMessage(parsed.njBalance,
+                                               'BANK_BALANCE_CENTS',
+                                               'BANK_UPDATED_AT', calibratedAt));
+    merge(bankCalibration, bankBalanceMessage(parsed.zsBalance,
+                                               'CMB_BALANCE_CENTS',
+                                               'CMB_EVENT_AT', calibratedAt));
+    merge(bankCalibration, bankBalanceMessage(parsed.gsBalance,
+                                               'ICBC_BALANCE_CENTS',
+                                               'ICBC_UPDATED_AT', calibratedAt));
     delete parsed.claude7d;
     delete parsed.codex7pct;
     delete parsed.codex7d;
-    delete parsed.cmbBalance;
+    delete parsed.njBalance;
+    delete parsed.zsBalance;
+    delete parsed.gsBalance;
     if (parsed.codexClear) {
       localStorage.removeItem('codex_oauth');
       clearCodexLogin();
@@ -892,7 +907,7 @@ Pebble.addEventListener('webviewclosed', function (e) {
     sendAppearance();
     sendTargetDate();
     send(calibration);
-    send(cmbCalibration);
+    send(bankCalibration);
     refreshQuotas(true);
     refreshWeather();
     if (startCodex) startCodexLogin();
