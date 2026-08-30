@@ -72,6 +72,13 @@
           "file": "fonts/bank_labels.ttf",
           "characterRegex": "[南京银行招商工]",
           "pixelHeight": 11
+        },
+        {
+          "type": "font",
+          "name": "FONT_LUNAR_LABELS_11",
+          "file": "fonts/lunar_labels.ttf",
+          "characterRegex": "[农历闰正二三四五六七八九十冬腊初廿]",
+          "pixelHeight": 11
         }
       ]
     }

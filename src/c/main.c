@@ -117,6 +117,7 @@ static int32_t s_cmb_event_index;
 static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
 static int s_bank_display_index;     // NJ, CMB, ICBC, then total
+static bool s_show_lunar;
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -168,6 +169,7 @@ static const Theme THEMES[2] = {
 static Window *s_window;
 static GFont s_consolas_font;          // loaded at window_load, freed at unload
 static GFont s_bank_font;              // compact Chinese bank labels
+static GFont s_lunar_font;             // compact Chinese lunar date
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
@@ -187,7 +189,7 @@ static TextLayer *s_pct_layers[ROW_COUNT];
 static TextLayer *s_reset_layers[ROW_COUNT];
 
 static char s_time_buf[8];
-static char s_date_buf[16];
+static char s_date_buf[32];
 static char s_countdown_buf[10];
 static char s_birthday_buf[12];
 static char s_dday_buf[8];
@@ -196,6 +198,8 @@ static char s_bank_balance_buf[20];
 static char s_bank_sum_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
 static char s_reset_buf[ROW_COUNT][12];
+
+static void update_date(struct tm *t);
 
 // ------------------------------------------------------------------- layout
 
@@ -211,10 +215,10 @@ static char s_reset_buf[ROW_COUNT][12];
 #define BATT_Y        3
 #define BATT_W        19
 #define BATT_H        10
-#define GHD_X         116
-#define GHD_Y         -5
+#define GHD_X         112
+#define GHD_Y         3
 #define GHD_W         28
-#define GHD_H         21
+#define GHD_H         13
 #define BIRTHDAY_X    2
 #define BIRTHDAY_Y    17
 #define BIRTHDAY_W    24
@@ -574,6 +578,9 @@ static void update_bank(void) {
 static void bank_timer_handler(void *context) {
   s_bank_timer = NULL;
   s_bank_display_index = (s_bank_display_index + 1) % 3;
+  s_show_lunar = !s_show_lunar;
+  time_t now = time(NULL);
+  update_date(localtime(&now));
   update_bank();
   s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
 }
@@ -593,6 +600,94 @@ static time_t local_midnight(time_t t) {
   tm.tm_min = 0;
   tm.tm_sec = 0;
   return mktime(&tm);
+}
+
+// Lunar data for 2000-2039. The watch only needs the compact month/day label;
+// dates outside this small table fall back to the Gregorian display.
+static const uint32_t LUNAR_INFO[] = {
+  0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0,
+  0x092d0, 0x0cab5, 0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0,
+  0x0a5b0, 0x15176, 0x052b0, 0x0a930, 0x07954, 0x06aa0, 0x0ad50, 0x05b52,
+  0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530, 0x05aa0, 0x076a3,
+  0x096d0, 0x04afb, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45
+};
+
+static int lunar_leap_month(int year) {
+  return LUNAR_INFO[year - 2000] & 0xf;
+}
+
+static int lunar_leap_days(int year) {
+  uint32_t info = LUNAR_INFO[year - 2000];
+  return lunar_leap_month(year) ? ((info & 0x10000) ? 30 : 29) : 0;
+}
+
+static int lunar_month_days(int year, int month) {
+  return (LUNAR_INFO[year - 2000] & (0x10000 >> month)) ? 30 : 29;
+}
+
+static int lunar_year_days(int year) {
+  int days = 348;
+  uint32_t info = LUNAR_INFO[year - 2000];
+  for (uint32_t mask = 0x8000; mask > 0x8; mask >>= 1)
+    if (info & mask) days++;
+  return days + lunar_leap_days(year);
+}
+
+static void format_lunar_date(struct tm *t) {
+  static const char *months[] = {
+    "", "正", "二", "三", "四", "五", "六", "七", "八", "九", "十", "冬", "腊"
+  };
+  static const char *days[] = {
+    "", "初一", "初二", "初三", "初四", "初五", "初六", "初七", "初八", "初九", "初十",
+    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "廿",
+    "廿一", "廿二", "廿三", "廿四", "廿五", "廿六", "廿七", "廿八", "廿九", "三十"
+  };
+  int year = t->tm_year + 1900;
+  // 2000-02-05 is lunar 2000-01-01.
+  int offset = -35;
+  if (year < 2000 || year >= 2040) {
+    snprintf(s_date_buf, sizeof(s_date_buf), "--");
+    return;
+  }
+  for (int y = 2000; y < year; y++) offset += lunar_year_days(y);
+  static const int month_days[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+  for (int m = 1; m < t->tm_mon + 1; m++) {
+    offset += month_days[m - 1];
+    if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) offset++;
+  }
+  offset += t->tm_mday - 1;
+  int lunar_year = 2000;
+  while (lunar_year < 2039 && offset >= lunar_year_days(lunar_year)) {
+    offset -= lunar_year_days(lunar_year++);
+  }
+  int lunar_month = 1;
+  bool leap = false;
+  while (lunar_month <= 12) {
+    int days_in_month = leap ? lunar_leap_days(lunar_year)
+                             : lunar_month_days(lunar_year, lunar_month);
+    if (offset < days_in_month) break;
+    offset -= days_in_month;
+    if (lunar_leap_month(lunar_year) == lunar_month && !leap) {
+      leap = true;
+    } else {
+      if (leap) leap = false;
+      lunar_month++;
+    }
+  }
+  int lunar_day = offset + 1;
+  snprintf(s_date_buf, sizeof(s_date_buf), "农历%s月%s%s",
+           leap ? "闰" : "", months[lunar_month], days[lunar_day]);
+}
+
+static void update_date(struct tm *t) {
+  if (s_show_lunar) {
+    format_lunar_date(t);
+    text_layer_set_font(s_date_layer, s_lunar_font);
+  } else {
+    strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
+    text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  }
+  text_layer_set_text(s_date_layer, s_date_buf);
 }
 
 // Whole days from today to the target, counted in local calendar days so the
@@ -650,8 +745,7 @@ static void update_clock(struct tm *t) {
 #endif
   text_layer_set_text(s_time_layer, s_time_buf);
 
-  strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
-  text_layer_set_text(s_date_layer, s_date_buf);
+  update_date(t);
 }
 
 static void update_ui(void) {
@@ -1148,6 +1242,7 @@ static void window_load(Window *window) {
 
   s_consolas_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_CONSOLAS_38));
   s_bank_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_BANK_LABELS_11));
+  s_lunar_font = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_LUNAR_LABELS_11));
 
   s_time_layer = make_text(root, GRect(0, TIME_Y, SCREEN_W, TIME_H),
                            time_font(), GTextAlignmentCenter, THEMES[s_theme].fg);
@@ -1267,6 +1362,7 @@ static void window_unload(Window *window) {
   text_layer_destroy(s_bank_meta_layer);
   text_layer_destroy(s_bank_balance_layer);
   text_layer_destroy(s_bank_sum_layer);
+  fonts_unload_custom_font(s_lunar_font);
   fonts_unload_custom_font(s_bank_font);
   fonts_unload_custom_font(s_consolas_font);
   layer_destroy(s_rows_layer);
