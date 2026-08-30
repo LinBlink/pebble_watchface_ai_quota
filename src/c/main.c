@@ -531,9 +531,8 @@ static void format_bank_balance(char *buf, size_t size, int64_t cents) {
              (unsigned long)(hundredths_k / 100),
              (unsigned long)(hundredths_k % 100));
   } else {
-    snprintf(buf, size, "%s%lu.%02lu", negative ? "-" : "",
-             (unsigned long)(absolute / 100),
-             (unsigned long)(absolute % 100));
+    snprintf(buf, size, "%s%lu", negative ? "-" : "",
+             (unsigned long)(absolute / 100));
   }
 }
 
