@@ -676,16 +676,18 @@ static void format_lunar_date(struct tm *t) {
     }
   }
   int lunar_day = offset + 1;
-  snprintf(s_date_buf, sizeof(s_date_buf), "%s月%s%s",
-           leap ? "闰" : "", months[lunar_month], days[lunar_day]);
+  // Use a compact numeric label here: Pebble's small Chinese font can clip
+  // repeated edge glyphs in a four-character lunar date.
+  snprintf(s_date_buf, sizeof(s_date_buf), "L%02d-%02d",
+           lunar_month, lunar_day);
 }
 
 static void update_date(struct tm *t) {
   if (s_show_lunar) {
     format_lunar_date(t);
-    text_layer_set_font(s_date_layer, s_lunar_font);
+    text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
     layer_set_frame(text_layer_get_layer(s_date_layer),
-                    GRect(DATE_X, DATE_LUNAR_Y, DATE_W, DATE_H));
+                    GRect(DATE_X, DATE_Y, DATE_W, DATE_H));
   } else {
     strftime(s_date_buf, sizeof(s_date_buf), "%a %m-%d", t);
     text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
