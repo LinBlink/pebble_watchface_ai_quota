@@ -77,7 +77,7 @@
           "type": "font",
           "name": "FONT_LUNAR_LABELS_11",
           "file": "fonts/lunar_labels.ttf",
-          "characterRegex": "[农历闰正二三四五六七八九十冬腊初廿]",
+          "characterRegex": "[农历闰正二三四五六七八九十冬腊初廿月]",
           "pixelHeight": 11
         }
       ]
