@@ -36,6 +36,8 @@ static const RowSpec ROWS[ROW_COUNT] = {
 #define PERSIST_CODE(i)    (200 + (i) * 2 + 1)
 #define PERSIST_SUNRISE    206
 #define PERSIST_SUNSET     207
+#define PERSIST_NEXT_EVENT_START 208
+#define PERSIST_NEXT_EVENT_TITLE 209
 #define PERSIST_LAST_SYNC(p) (320 + (p))  // 0 = claude, 1 = minimax
 #define PERSIST_TARGET     301
 #define PERSIST_THEME      310
@@ -97,6 +99,7 @@ static int32_t s_temp[WX_COUNT];     // NO_TEMP = no data yet
 static int32_t s_code[WX_COUNT];     // WMO weather code
 static int32_t s_sunrise;
 static int32_t s_sunset;
+static int32_t s_next_event_start;
 // UTC epoch of the last quota push per provider (0 = claude, 1 = minimax), 0 =
 // never. Tracked separately because the two providers fail independently — if
 // only one of them is actually landing pushes, its rows must grey out on their
@@ -122,7 +125,7 @@ static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
 static int s_bank_display_index;     // NJ, CMB, ICBC, then total
 static bool s_show_lunar;
-static bool s_show_sun_times;
+static int s_weather_page;  // 0 = forecast, 1 = sunrise/sunset, 2 = next event
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -203,6 +206,8 @@ static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
 static char s_sunrise_buf[12];
 static char s_sunset_buf[12];
+static char s_next_event_title[40];
+static char s_next_event_buf[52];
 static char s_bank_balance_buf[20];
 static char s_bank_sum_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
@@ -378,7 +383,7 @@ static void draw_small_wx_icon(GContext *ctx, int x, WxIcon icon) {
 }
 
 static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
-  if (s_show_sun_times) return;
+  if (s_weather_page != 0) return;
   for (int i = 0; i < WX_COUNT; i++) {
     WxIcon icon = s_temp[i] == NO_TEMP ? WX_UNKNOWN : wmo_icon(s_code[i]);
     draw_small_wx_icon(ctx, i * WX_COL_W, icon);
@@ -508,7 +513,26 @@ static void update_rows(time_t now) {
 }
 
 static void update_weather(void) {
-  if (s_show_sun_times) {
+  if (s_weather_page == 2) {
+    if (s_next_event_start > (int32_t)time(NULL) && s_next_event_title[0]) {
+      time_t event_at = s_next_event_start;
+      struct tm *event_time = localtime(&event_at);
+      strftime(s_next_event_buf, sizeof(s_next_event_buf), "%H:%M ", event_time);
+      strncat(s_next_event_buf, s_next_event_title,
+              sizeof(s_next_event_buf) - strlen(s_next_event_buf) - 1);
+    } else {
+      snprintf(s_next_event_buf, sizeof(s_next_event_buf), "--:-- FREE");
+    }
+    layer_set_frame(text_layer_get_layer(s_wx_temp_layers[0]),
+                    GRect(3, WX_Y, SCREEN_W - 6, WX_TEMP_H));
+    text_layer_set_text_alignment(s_wx_temp_layers[0], GTextAlignmentLeft);
+    text_layer_set_text(s_wx_temp_layers[0], s_next_event_buf);
+    text_layer_set_text(s_wx_temp_layers[1], "");
+    text_layer_set_text(s_wx_temp_layers[2], "");
+    layer_mark_dirty(s_wx_icons_layer);
+    return;
+  }
+  if (s_weather_page == 1) {
     if (s_sunrise > 0) {
       time_t sunrise_at = s_sunrise;
       struct tm *sunrise = localtime(&sunrise_at);
@@ -643,7 +667,7 @@ static void date_timer_handler(void *context) {
 
 static void weather_timer_handler(void *context) {
   s_weather_timer = NULL;
-  s_show_sun_times = !s_show_sun_times;
+  s_weather_page = (s_weather_page + 1) % 3;
   update_weather();
   s_weather_timer = app_timer_register(next_whimsy_delay(), weather_timer_handler, NULL);
 }
@@ -1200,6 +1224,17 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *sunset = dict_find(it, MESSAGE_KEY_WX_SUNSET);
   if (sunrise) store_int(PERSIST_SUNRISE, &s_sunrise, sunrise->value->int32);
   if (sunset) store_int(PERSIST_SUNSET, &s_sunset, sunset->value->int32);
+  Tuple *next_event_start = dict_find(it, MESSAGE_KEY_NEXT_EVENT_START);
+  Tuple *next_event_title = dict_find(it, MESSAGE_KEY_NEXT_EVENT_TITLE);
+  if (next_event_start) {
+    store_int(PERSIST_NEXT_EVENT_START, &s_next_event_start,
+              next_event_start->value->int32);
+  }
+  if (next_event_title) {
+    snprintf(s_next_event_title, sizeof(s_next_event_title), "%s",
+             next_event_title->value->cstring);
+    persist_write_string(PERSIST_NEXT_EVENT_TITLE, s_next_event_title);
+  }
 
   Tuple *target = dict_find(it, MESSAGE_KEY_TARGET_DATE);
   if (target) store_int(PERSIST_TARGET, &s_target_date, target->value->int32);
@@ -1255,6 +1290,14 @@ static void load_persisted(void) {
   }
   s_sunrise = persist_exists(PERSIST_SUNRISE) ? persist_read_int(PERSIST_SUNRISE) : 0;
   s_sunset = persist_exists(PERSIST_SUNSET) ? persist_read_int(PERSIST_SUNSET) : 0;
+  s_next_event_start = persist_exists(PERSIST_NEXT_EVENT_START)
+                         ? persist_read_int(PERSIST_NEXT_EVENT_START) : 0;
+  if (persist_exists(PERSIST_NEXT_EVENT_TITLE)) {
+    persist_read_string(PERSIST_NEXT_EVENT_TITLE, s_next_event_title,
+                        sizeof(s_next_event_title));
+  } else {
+    s_next_event_title[0] = '\0';
+  }
   for (int p = 0; p < 2; p++) {
     s_last_sync[p] = persist_exists(PERSIST_LAST_SYNC(p)) ? persist_read_int(PERSIST_LAST_SYNC(p)) : 0;
   }

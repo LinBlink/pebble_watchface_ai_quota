@@ -32,8 +32,6 @@
       "WX_CODE_6H",
       "WX_TEMP_24H",
       "WX_CODE_24H",
-      "WX_SUNRISE",
-      "WX_SUNSET",
       "REQUEST_REFRESH",
       "TARGET_DATE",
       "THEME",
@@ -50,7 +48,11 @@
       "CMB_EVENT_ID",
       "CMB_EVENT_AT",
       "ICBC_BALANCE_CENTS",
-      "ICBC_UPDATED_AT"
+      "ICBC_UPDATED_AT",
+      "WX_SUNRISE",
+      "WX_SUNSET",
+      "NEXT_EVENT_START",
+      "NEXT_EVENT_TITLE"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {
