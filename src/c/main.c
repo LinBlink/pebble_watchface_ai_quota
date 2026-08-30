@@ -186,6 +186,8 @@ static TextLayer *s_bank_meta_layer;
 static TextLayer *s_bank_balance_layer;
 static TextLayer *s_bank_sum_layer;
 static AppTimer *s_bank_timer;
+static AppTimer *s_date_timer;
+static AppTimer *s_weather_timer;
 static TextLayer *s_separators[3];
 static Layer *s_status_layer;
 static Layer *s_rows_layer;
@@ -205,8 +207,16 @@ static char s_bank_balance_buf[20];
 static char s_bank_sum_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
 static char s_reset_buf[ROW_COUNT][12];
+static uint32_t s_whimsy;
 
 static void update_date(struct tm *t);
+
+// A tiny deterministic bit of whimsy keeps independent panels from marching
+// in lockstep while staying close enough to a one-second cadence.
+static uint32_t next_whimsy_delay(void) {
+  s_whimsy = s_whimsy * 1664525u + 1013904223u;
+  return 850 + (s_whimsy % 301);  // 0.85–1.15 seconds
+}
 
 // ------------------------------------------------------------------- layout
 
@@ -619,13 +629,23 @@ static void update_bank(void) {
 static void bank_timer_handler(void *context) {
   s_bank_timer = NULL;
   s_bank_display_index = (s_bank_display_index + 1) % 3;
+  update_bank();
+  s_bank_timer = app_timer_register(next_whimsy_delay(), bank_timer_handler, NULL);
+}
+
+static void date_timer_handler(void *context) {
+  s_date_timer = NULL;
   s_show_lunar = !s_show_lunar;
-  s_show_sun_times = !s_show_sun_times;
   time_t now = time(NULL);
   update_date(localtime(&now));
+  s_date_timer = app_timer_register(next_whimsy_delay(), date_timer_handler, NULL);
+}
+
+static void weather_timer_handler(void *context) {
+  s_weather_timer = NULL;
+  s_show_sun_times = !s_show_sun_times;
   update_weather();
-  update_bank();
-  s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
+  s_weather_timer = app_timer_register(next_whimsy_delay(), weather_timer_handler, NULL);
 }
 
 // Minutes until the next 22:00 local, which is what the countdown line shows.
@@ -1401,13 +1421,24 @@ static void window_load(Window *window) {
   }
 
   update_ui();
-  s_bank_timer = app_timer_register(1000, bank_timer_handler, NULL);
+  s_whimsy = (uint32_t)time(NULL) ^ 0xa1c0deu;
+  s_bank_timer = app_timer_register(next_whimsy_delay(), bank_timer_handler, NULL);
+  s_date_timer = app_timer_register(next_whimsy_delay(), date_timer_handler, NULL);
+  s_weather_timer = app_timer_register(next_whimsy_delay(), weather_timer_handler, NULL);
 }
 
 static void window_unload(Window *window) {
   if (s_bank_timer) {
     app_timer_cancel(s_bank_timer);
     s_bank_timer = NULL;
+  }
+  if (s_date_timer) {
+    app_timer_cancel(s_date_timer);
+    s_date_timer = NULL;
+  }
+  if (s_weather_timer) {
+    app_timer_cancel(s_weather_timer);
+    s_weather_timer = NULL;
   }
   for (int i = 0; i < ROW_COUNT; i++) {
     text_layer_destroy(s_label_layers[i]);
