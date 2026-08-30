@@ -198,6 +198,7 @@ static char s_birthday_buf[12];
 static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
 static char s_bank_balance_buf[20];
+static char s_bank_sum_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
 static char s_reset_buf[ROW_COUNT][12];
 
@@ -585,11 +586,11 @@ static void update_bank(void) {
                             stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
 
   if (known) {
-    format_bank_balance(s_bank_balance_buf, sizeof(s_bank_balance_buf), total);
+    format_bank_balance(s_bank_sum_buf, sizeof(s_bank_sum_buf), total);
   } else {
-    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
+    snprintf(s_bank_sum_buf, sizeof(s_bank_sum_buf), "--");
   }
-  text_layer_set_text(s_bank_sum_layer, s_bank_balance_buf);
+  text_layer_set_text(s_bank_sum_layer, s_bank_sum_buf);
   int32_t newest = s_bank_updated;
   if (s_cmb_updated > newest) newest = s_cmb_updated;
   if (s_icbc_updated > newest) newest = s_icbc_updated;
