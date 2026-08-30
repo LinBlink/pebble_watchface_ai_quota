@@ -118,12 +118,6 @@ static int32_t s_icbc_balance_cents; // absolute balance from ICBC notifications
 static int32_t s_icbc_updated;
 static int s_bank_display_index;     // NJ, CMB, ICBC, then total
 
-static const uint32_t BALANCE_VIBE_DURATIONS[] = { 3000 };
-static const VibePattern BALANCE_CHANGED_VIBE = {
-  .durations = BALANCE_VIBE_DURATIONS,
-  .num_segments = 1,
-};
-
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
 // looks right even before the first AppMessage lands.
@@ -216,10 +210,10 @@ static char s_reset_buf[ROW_COUNT][12];
 #define BATT_Y        3
 #define BATT_W        19
 #define BATT_H        10
-#define GHD_X         103
-#define GHD_Y         -2
-#define GHD_W         25
-#define GHD_H         18
+#define GHD_X         116
+#define GHD_Y         -5
+#define GHD_W         28
+#define GHD_H         21
 #define BIRTHDAY_X    2
 #define BIRTHDAY_Y    17
 #define BIRTHDAY_W    24
@@ -968,7 +962,6 @@ static void check_reset_alerts(time_t now) {
 }
 
 static void inbox_received(DictionaryIterator *it, void *context) {
-  bool balance_changed = false;
   apply_reset_only(it, MESSAGE_KEY_CLAUDE_5H_RESET, 0);
   apply_reset_only(it, MESSAGE_KEY_CLAUDE_WK_RESET, 1);
   apply_codex_quota(it, MESSAGE_KEY_CODEX_5H_PCT, MESSAGE_KEY_CODEX_5H_RESET, 0);
@@ -991,8 +984,6 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *bank_updated = dict_find(it, MESSAGE_KEY_BANK_UPDATED_AT);
   if (bank_balance && bank_updated &&
       bank_updated->value->int32 >= s_bank_updated) {
-    balance_changed = s_bank_updated > 0 &&
-                      s_bank_balance_cents != bank_balance->value->int32;
     store_int(PERSIST_BANK_BALANCE, &s_bank_balance_cents,
               bank_balance->value->int32);
     store_int(PERSIST_BANK_UPDATED, &s_bank_updated,
@@ -1006,9 +997,6 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   if (cmb_balance && cmb_event_at &&
       cmb_event_at->value->int32 >= s_cmb_updated) {
     int32_t at = cmb_event_at->value->int32;
-    balance_changed = balance_changed ||
-                      (s_cmb_baseline_at > 0 &&
-                       s_cmb_balance_cents != cmb_balance->value->int32);
     store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents,
               cmb_balance->value->int32);
     store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
@@ -1020,7 +1008,6 @@ static void inbox_received(DictionaryIterator *it, void *context) {
     if (id && at > s_cmb_baseline_at && !cmb_event_seen(id)) {
       int64_t next = (int64_t)s_cmb_balance_cents + cmb_delta->value->int32;
       if (next >= INT32_MIN && next <= INT32_MAX) {
-        balance_changed = balance_changed || cmb_delta->value->int32 != 0;
         store_int(PERSIST_CMB_BALANCE, &s_cmb_balance_cents, (int32_t)next);
         store_int(PERSIST_CMB_UPDATED, &s_cmb_updated, at);
         remember_cmb_event(id);
@@ -1032,9 +1019,6 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   Tuple *icbc_updated = dict_find(it, MESSAGE_KEY_ICBC_UPDATED_AT);
   if (icbc_balance && icbc_updated &&
       icbc_updated->value->int32 >= s_icbc_updated) {
-    balance_changed = balance_changed ||
-                      (s_icbc_updated > 0 &&
-                       s_icbc_balance_cents != icbc_balance->value->int32);
     store_int(PERSIST_ICBC_BALANCE, &s_icbc_balance_cents,
               icbc_balance->value->int32);
     store_int(PERSIST_ICBC_UPDATED, &s_icbc_updated,
@@ -1074,7 +1058,6 @@ static void inbox_received(DictionaryIterator *it, void *context) {
   layer_mark_dirty(s_status_layer);
   check_quota_alerts();
   check_reset_alerts(now);
-  if (balance_changed) vibes_enqueue_custom_pattern(BALANCE_CHANGED_VIBE);
   apply_theme();
   update_ui();
 }
