@@ -622,45 +622,12 @@ function refreshQuotas(force) {
 
 // ------------------------------------------------------------------ weather
 
-// Open-Meteo returns hourly arrays; pick the entry closest to the wanted time.
-function hourlyIndexFor(times, targetSec) {
-  var best = -1;
-  var bestDiff = Infinity;
-  for (var i = 0; i < times.length; i++) {
-    var diff = Math.abs(times[i] - targetSec);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = i;
-    }
-  }
-  return best;
-}
-
 function buildWeatherMessage(data) {
   var msg = {};
-  var now = Math.floor(Date.now() / 1000);
 
   if (data.current && typeof data.current.temperature_2m === 'number') {
     msg.WX_TEMP_NOW = Math.round(data.current.temperature_2m);
     msg.WX_CODE_NOW = data.current.weather_code;
-  }
-
-  var hourly = data.hourly;
-  if (hourly && hourly.time && hourly.time.length) {
-    [[6, '6H'], [24, '24H']].forEach(function (spec) {
-      var idx = hourlyIndexFor(hourly.time, now + spec[0] * 3600);
-      if (idx < 0) return;
-      msg['WX_TEMP_' + spec[1]] = Math.round(hourly.temperature_2m[idx]);
-      msg['WX_CODE_' + spec[1]] = hourly.weather_code[idx];
-    });
-    // Fall back to the hourly series if the current block was missing.
-    if (msg.WX_TEMP_NOW === undefined) {
-      var i0 = hourlyIndexFor(hourly.time, now);
-      if (i0 >= 0) {
-        msg.WX_TEMP_NOW = Math.round(hourly.temperature_2m[i0]);
-        msg.WX_CODE_NOW = hourly.weather_code[i0];
-      }
-    }
   }
   return msg;
 }
@@ -670,8 +637,7 @@ function fetchWeather(lat, lon) {
   var url = 'https://api.open-meteo.com/v1/forecast' +
             '?latitude=' + lat + '&longitude=' + lon +
             '&current=temperature_2m,weather_code' +
-            '&hourly=temperature_2m,weather_code' +
-            '&forecast_days=3&timeformat=unixtime&timezone=UTC' +
+            '&forecast_days=1&timezone=UTC' +
             '&temperature_unit=' + cfg.units;
   getJSON(url, {}, function (data) { send(buildWeatherMessage(data)); });
 }

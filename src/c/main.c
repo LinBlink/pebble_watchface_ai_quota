@@ -10,7 +10,7 @@
 #define SCREEN_W 144
 
 #define ROW_COUNT 4
-#define WX_COUNT  3
+#define WX_COUNT  1
 
 #define NO_TEMP (-999)
 
@@ -31,8 +31,6 @@ static const RowSpec ROWS[ROW_COUNT] = {
   { "MM 7D", false, true  },
 };
 
-static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
-
 // Persistent storage keys
 #define PERSIST_PCT(i)     (100 + (i) * 2)
 #define PERSIST_RESET(i)   (100 + (i) * 2 + 1)
@@ -52,6 +50,10 @@ static const char *WX_LABELS[WX_COUNT] = { "NOW", "+6H", "+24H" };
 #define PERSIST_GITHUB_COMMITS 540
 #define PERSIST_GITHUB_SYNC    541
 #define PERSIST_GITHUB_LATEST  542
+#define PERSIST_BANK_NAME      550
+#define PERSIST_BANK_LAST4     551
+#define PERSIST_BANK_BALANCE   552
+#define PERSIST_BANK_UPDATED   553
 
 // Buzz once when a quota first crosses this. Persisted per row so a restart
 // doesn't re-alert, and cleared when the window resets so the next crossing
@@ -99,6 +101,10 @@ static bool s_codex_reset_alerted[2];
 static int32_t s_github_commits;      // commits authored today, -1 = no data
 static int32_t s_github_sync;         // UTC epoch of last successful GitHub fetch
 static int32_t s_github_latest;       // UTC epoch of the most recent visible commit
+static char s_bank_name[8];           // short bank label, e.g. CMB
+static char s_bank_last4[5];          // card number suffix only
+static int32_t s_bank_balance_cents;  // integer cents; -1 = no data
+static int32_t s_bank_updated;        // UTC epoch from the SMS parser
 
 // Settings pushed from the phone. s_theme picks THEMES[], s_time_font picks the
 // clock face font. Defaults match the phone-side DEFAULTS so a fresh install
@@ -154,10 +160,12 @@ static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
 static TextLayer *s_birthday_layer;
 static TextLayer *s_dday_layer;
-static TextLayer *s_wx_label_layers[WX_COUNT];
-static TextLayer *s_wx_temp_layers[WX_COUNT];
+static TextLayer *s_wx_summary_layer;
+static TextLayer *s_wx_temp_layer;
 static Layer *s_wx_icons_layer;
-static TextLayer *s_separators[2];
+static TextLayer *s_bank_meta_layer;
+static TextLayer *s_bank_balance_layer;
+static TextLayer *s_separators[3];
 static Layer *s_status_layer;
 static Layer *s_rows_layer;
 static TextLayer *s_label_layers[ROW_COUNT];
@@ -169,7 +177,9 @@ static char s_date_buf[16];
 static char s_countdown_buf[10];
 static char s_birthday_buf[12];
 static char s_dday_buf[8];
-static char s_wx_temp_buf[WX_COUNT][8];
+static char s_wx_temp_buf[8];
+static char s_bank_meta_buf[16];
+static char s_bank_balance_buf[20];
 static char s_pct_buf[ROW_COUNT][12];
 static char s_reset_buf[ROW_COUNT][12];
 
@@ -205,20 +215,27 @@ static char s_reset_buf[ROW_COUNT][12];
 
 #define SEP1_Y        57
 
-// Weather: icon and temperature sit side by side on one line per column. The
-// old second caption line ("Cloud", "Drizl") cost 15px and was the least
-// legible thing on the screen; the icon says the same in less space, and the
-// reclaimed height goes to the quota rows below.
-#define WX_COL_W      (SCREEN_W / WX_COUNT)
+// Current weather is one compact line. Forecast columns were removed so the
+// second line can show a bank balance without shrinking the quota rows.
 #define WX_LABEL_Y    58
-#define WX_LABEL_H    13
-#define WX_ICON_Y     74
+#define WX_LABEL_H    20
+#define WX_ICON_Y     58
 #define WX_ICON_SZ    22
-#define WX_ICON_X     1
-#define WX_TEMP_X     23
-#define WX_TEMP_W     25
+#define WX_ICON_X     3
+#define WX_TEMP_X     27
+#define WX_TEMP_W     36
 #define WX_TEMP_H     20
-#define SEP2_Y        98
+#define WX_SUMMARY_X  65
+#define WX_SUMMARY_W  76
+#define SEP_WX_Y      78
+
+#define BANK_Y        79
+#define BANK_H        20
+#define BANK_META_X   3
+#define BANK_META_W   54
+#define BANK_VALUE_X  55
+#define BANK_VALUE_W  86
+#define SEP2_Y        99
 
 // 17px per row leaves 15px of text above a 2px bar. The text sits 1px high of
 // the row origin so glyph baselines clear the bar — at y+0 the 14px font's
@@ -367,14 +384,12 @@ static void draw_wx_icon(GContext *ctx, int x, int y, WxIcon icon) {
 }
 
 static void wx_icons_update_proc(Layer *layer, GContext *ctx) {
-  for (int i = 0; i < WX_COUNT; i++) {
 #ifdef ICON_PREVIEW
-    WxIcon icon = (WxIcon)((ICON_PREVIEW + i) % (WX_UNKNOWN + 1));
+  WxIcon icon = (WxIcon)(ICON_PREVIEW % (WX_UNKNOWN + 1));
 #else
-    WxIcon icon = (s_temp[i] == NO_TEMP) ? WX_UNKNOWN : wmo_icon(s_code[i]);
+  WxIcon icon = (s_temp[0] == NO_TEMP) ? WX_UNKNOWN : wmo_icon(s_code[0]);
 #endif
-    draw_wx_icon(ctx, i * WX_COL_W + WX_ICON_X, 0, icon);
-  }
+  draw_wx_icon(ctx, WX_ICON_X, 0, icon);
 }
 
 // ---------------------------------------------------------------- formatting
@@ -523,16 +538,55 @@ static void update_rows(time_t now) {
   layer_mark_dirty(s_rows_layer);
 }
 
-static void update_weather(void) {
-  for (int i = 0; i < WX_COUNT; i++) {
-    if (s_temp[i] == NO_TEMP) {
-      snprintf(s_wx_temp_buf[i], sizeof(s_wx_temp_buf[i]), "--");
-    } else {
-      snprintf(s_wx_temp_buf[i], sizeof(s_wx_temp_buf[i]), "%ld°", (long)s_temp[i]);
-    }
-    text_layer_set_text(s_wx_temp_layers[i], s_wx_temp_buf[i]);
+static const char *weather_summary(int32_t code) {
+  switch (wmo_icon(code)) {
+    case WX_SUN:       return "Clear";
+    case WX_SUN_CLOUD: return "Partly";
+    case WX_CLOUD:     return "Cloud";
+    case WX_FOG:       return "Fog";
+    case WX_DRIZZLE:   return "Drizzle";
+    case WX_RAIN:      return "Rain";
+    case WX_SNOW:      return "Snow";
+    case WX_STORM:     return "Storm";
+    default:           return "Weather";
   }
+}
+
+static void update_weather(void) {
+  if (s_temp[0] == NO_TEMP) {
+    snprintf(s_wx_temp_buf, sizeof(s_wx_temp_buf), "--");
+  } else {
+    snprintf(s_wx_temp_buf, sizeof(s_wx_temp_buf), "%ld°", (long)s_temp[0]);
+  }
+  text_layer_set_text(s_wx_temp_layer, s_wx_temp_buf);
+  text_layer_set_text(s_wx_summary_layer, weather_summary(s_code[0]));
   layer_mark_dirty(s_wx_icons_layer);
+}
+
+static void update_bank(void) {
+  if (!s_bank_name[0] && !s_bank_last4[0]) {
+    snprintf(s_bank_meta_buf, sizeof(s_bank_meta_buf), "BANK");
+  } else if (s_bank_last4[0]) {
+    snprintf(s_bank_meta_buf, sizeof(s_bank_meta_buf), "%s %s",
+             s_bank_name[0] ? s_bank_name : "BANK", s_bank_last4);
+  } else {
+    snprintf(s_bank_meta_buf, sizeof(s_bank_meta_buf), "%s", s_bank_name);
+  }
+  text_layer_set_text(s_bank_meta_layer, s_bank_meta_buf);
+
+  if (s_bank_balance_cents < 0) {
+    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "--");
+  } else {
+    snprintf(s_bank_balance_buf, sizeof(s_bank_balance_buf), "¥%ld.%02ld",
+             (long)(s_bank_balance_cents / 100),
+             (long)(s_bank_balance_cents % 100));
+  }
+  text_layer_set_text(s_bank_balance_layer, s_bank_balance_buf);
+
+  bool stale = s_bank_updated <= 0 ||
+               (int32_t)time(NULL) - s_bank_updated > 24 * 60 * 60;
+  text_layer_set_text_color(s_bank_balance_layer,
+                            stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
 }
 
 // Minutes until the next 22:00 local, which is what the countdown line shows.
@@ -619,6 +673,7 @@ static void update_ui(void) {
   update_dday(now);
   update_birthday(now);
   update_weather();
+  update_bank();
   advance_claude_reset(now);
   update_rows(now);
 }
@@ -749,13 +804,13 @@ static void apply_theme(void) {
   text_layer_set_text_color(s_birthday_layer, t->fg_dim);
   text_layer_set_text_color(s_dday_layer, t->fg);
 
-  for (int i = 0; i < WX_COUNT; i++) {
-    text_layer_set_text_color(s_wx_label_layers[i], t->fg_dim);
-    text_layer_set_text_color(s_wx_temp_layers[i], t->fg);
-  }
+  text_layer_set_text_color(s_wx_summary_layer, t->fg_dim);
+  text_layer_set_text_color(s_wx_temp_layer, t->fg);
+  text_layer_set_text_color(s_bank_meta_layer, t->fg_dim);
 
   text_layer_set_background_color(s_separators[0], t->separator);
   text_layer_set_background_color(s_separators[1], t->separator);
+  text_layer_set_background_color(s_separators[2], t->separator);
 
   for (int i = 0; i < ROW_COUNT; i++) {
     text_layer_set_text_color(s_label_layers[i], row_color(i));
@@ -765,6 +820,7 @@ static void apply_theme(void) {
   // update_rows() owns the percentage colour (placeholder / stale / normal),
   // so re-run it to pick up the new palette, then redraw the drawn layers.
   update_rows(time(NULL));
+  update_bank();
   layer_mark_dirty(s_status_layer);
   layer_mark_dirty(s_wx_icons_layer);
 }
@@ -890,9 +946,28 @@ static void inbox_received(DictionaryIterator *it, void *context) {
               github_latest->value->int32);
   }
 
+  Tuple *bank_name = dict_find(it, MESSAGE_KEY_BANK_NAME);
+  if (bank_name && bank_name->type == TUPLE_CSTRING) {
+    snprintf(s_bank_name, sizeof(s_bank_name), "%s", bank_name->value->cstring);
+    persist_write_string(PERSIST_BANK_NAME, s_bank_name);
+  }
+  Tuple *bank_last4 = dict_find(it, MESSAGE_KEY_BANK_CARD_LAST4);
+  if (bank_last4 && bank_last4->type == TUPLE_CSTRING) {
+    snprintf(s_bank_last4, sizeof(s_bank_last4), "%s", bank_last4->value->cstring);
+    persist_write_string(PERSIST_BANK_LAST4, s_bank_last4);
+  }
+  Tuple *bank_balance = dict_find(it, MESSAGE_KEY_BANK_BALANCE_CENTS);
+  if (bank_balance) {
+    store_int(PERSIST_BANK_BALANCE, &s_bank_balance_cents,
+              bank_balance->value->int32);
+  }
+  Tuple *bank_updated = dict_find(it, MESSAGE_KEY_BANK_UPDATED_AT);
+  if (bank_updated) {
+    store_int(PERSIST_BANK_UPDATED, &s_bank_updated,
+              bank_updated->value->int32);
+  }
+
   apply_weather(it, MESSAGE_KEY_WX_TEMP_NOW, MESSAGE_KEY_WX_CODE_NOW, 0);
-  apply_weather(it, MESSAGE_KEY_WX_TEMP_6H,  MESSAGE_KEY_WX_CODE_6H,  1);
-  apply_weather(it, MESSAGE_KEY_WX_TEMP_24H, MESSAGE_KEY_WX_CODE_24H, 2);
 
   Tuple *target = dict_find(it, MESSAGE_KEY_TARGET_DATE);
   if (target) store_int(PERSIST_TARGET, &s_target_date, target->value->int32);
@@ -960,6 +1035,16 @@ static void load_persisted(void) {
                     ? persist_read_int(PERSIST_GITHUB_SYNC) : 0;
   s_github_latest = persist_exists(PERSIST_GITHUB_LATEST)
                       ? persist_read_int(PERSIST_GITHUB_LATEST) : 0;
+  s_bank_name[0] = '\0';
+  s_bank_last4[0] = '\0';
+  if (persist_exists(PERSIST_BANK_NAME))
+    persist_read_string(PERSIST_BANK_NAME, s_bank_name, sizeof(s_bank_name));
+  if (persist_exists(PERSIST_BANK_LAST4))
+    persist_read_string(PERSIST_BANK_LAST4, s_bank_last4, sizeof(s_bank_last4));
+  s_bank_balance_cents = persist_exists(PERSIST_BANK_BALANCE)
+                           ? persist_read_int(PERSIST_BANK_BALANCE) : -1;
+  s_bank_updated = persist_exists(PERSIST_BANK_UPDATED)
+                     ? persist_read_int(PERSIST_BANK_UPDATED) : 0;
   for (int i = 0; i < ROW_COUNT; i++) {
     s_alerted[i] = persist_exists(PERSIST_ALERTED(i)) && persist_read_bool(PERSIST_ALERTED(i));
     s_reset_alerted[i] = persist_exists(PERSIST_RESET_ALERTED(i)) &&
@@ -1029,25 +1114,39 @@ static void window_load(Window *window) {
 
   s_bolt = gpath_create(&BOLT_INFO);
 
-  for (int i = 0; i < WX_COUNT; i++) {
-    int x = i * WX_COL_W;
-    s_wx_label_layers[i] = make_text(root, GRect(x, WX_LABEL_Y, WX_COL_W, WX_LABEL_H),
-                                     fonts_get_system_font(FONT_KEY_GOTHIC_14),
-                                     GTextAlignmentCenter, THEMES[s_theme].fg_dim);
-    text_layer_set_text(s_wx_label_layers[i], WX_LABELS[i]);
+  s_wx_temp_layer = make_text(root,
+                              GRect(WX_TEMP_X, WX_LABEL_Y, WX_TEMP_W, WX_TEMP_H),
+                              fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
+                              GTextAlignmentCenter, THEMES[s_theme].fg);
+  text_layer_set_text(s_wx_temp_layer, "--");
 
-    s_wx_temp_layers[i] = make_text(root,
-                                    GRect(x + WX_TEMP_X, WX_ICON_Y + 1, WX_TEMP_W, WX_TEMP_H),
-                                    fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD),
-                                    GTextAlignmentCenter, THEMES[s_theme].fg);
-    text_layer_set_text(s_wx_temp_layers[i], "--");
-  }
+  s_wx_summary_layer = make_text(root,
+                                 GRect(WX_SUMMARY_X, WX_LABEL_Y + 1,
+                                       WX_SUMMARY_W, WX_LABEL_H),
+                                 fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                                 GTextAlignmentRight, THEMES[s_theme].fg_dim);
+  text_layer_set_text(s_wx_summary_layer, "Weather");
 
   s_wx_icons_layer = layer_create(GRect(0, WX_ICON_Y, SCREEN_W, WX_ICON_SZ));
   layer_set_update_proc(s_wx_icons_layer, wx_icons_update_proc);
   layer_add_child(root, s_wx_icons_layer);
 
-  s_separators[1] = separator(root, SEP2_Y);
+  s_separators[1] = separator(root, SEP_WX_Y);
+
+  s_bank_meta_layer = make_text(root,
+                                GRect(BANK_META_X, BANK_Y + 2, BANK_META_W, BANK_H),
+                                fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                                GTextAlignmentLeft, THEMES[s_theme].fg_dim);
+  text_layer_set_text(s_bank_meta_layer, "BANK");
+
+  s_bank_balance_layer = make_text(root,
+                                   GRect(BANK_VALUE_X, BANK_Y - 4,
+                                         BANK_VALUE_W, BANK_H + 7),
+                                   fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                                   GTextAlignmentRight, THEMES[s_theme].fg);
+  text_layer_set_text(s_bank_balance_layer, "--");
+
+  s_separators[2] = separator(root, SEP2_Y);
 
   s_rows_layer = layer_create(GRect(0, ROWS_Y, SCREEN_W, ROW_H * ROW_COUNT));
   layer_set_update_proc(s_rows_layer, rows_update_proc);
@@ -1083,10 +1182,10 @@ static void window_unload(Window *window) {
     text_layer_destroy(s_pct_layers[i]);
     text_layer_destroy(s_reset_layers[i]);
   }
-  for (int i = 0; i < WX_COUNT; i++) {
-    text_layer_destroy(s_wx_label_layers[i]);
-    text_layer_destroy(s_wx_temp_layers[i]);
-  }
+  text_layer_destroy(s_wx_summary_layer);
+  text_layer_destroy(s_wx_temp_layer);
+  text_layer_destroy(s_bank_meta_layer);
+  text_layer_destroy(s_bank_balance_layer);
   layer_destroy(s_wx_icons_layer);
   gpath_destroy(s_bolt);
   fonts_unload_custom_font(s_consolas_font);
@@ -1094,6 +1193,7 @@ static void window_unload(Window *window) {
   layer_destroy(s_status_layer);
   text_layer_destroy(s_separators[0]);
   text_layer_destroy(s_separators[1]);
+  text_layer_destroy(s_separators[2]);
   text_layer_destroy(s_dday_layer);
   text_layer_destroy(s_birthday_layer);
   text_layer_destroy(s_countdown_layer);

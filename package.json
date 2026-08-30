@@ -38,7 +38,11 @@
       "TIME_FONT",
       "AI_PROVIDER",
       "GITHUB_TODAY_COMMITS",
-      "GITHUB_LATEST_COMMIT_AT"
+      "GITHUB_LATEST_COMMIT_AT",
+      "BANK_NAME",
+      "BANK_CARD_LAST4",
+      "BANK_BALANCE_CENTS",
+      "BANK_UPDATED_AT"
     ],
     "capabilities": ["configurable", "location"],
     "resources": {
