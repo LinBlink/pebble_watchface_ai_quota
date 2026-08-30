@@ -23,7 +23,7 @@ typedef struct {
 // advance_claude_reset/update_rows below): their bar/number instead show how
 // much of the current window has *elapsed*, derived from the reset countdown.
 static const RowSpec ROWS[ROW_COUNT] = {
-  { "GHD", false, false },
+  { "CL 5H", true,  false },
   { "CL 7D", true,  true  },
   { "MM 5H", false, false },
   { "MM 7D", false, true  },
@@ -176,7 +176,7 @@ static GFont s_consolas_font;          // loaded at window_load, freed at unload
 static TextLayer *s_time_layer;
 static TextLayer *s_date_layer;
 static TextLayer *s_countdown_layer;
-static TextLayer *s_birthday_layer;
+static TextLayer *s_github_top_layer;
 static TextLayer *s_dday_layer;
 static TextLayer *s_wx_temp_layers[WX_COUNT];
 static Layer *s_wx_icons_layer;
@@ -194,7 +194,7 @@ static TextLayer *s_reset_layers[ROW_COUNT];
 static char s_time_buf[8];
 static char s_date_buf[16];
 static char s_countdown_buf[10];
-static char s_birthday_buf[12];
+static char s_github_top_buf[16];
 static char s_dday_buf[8];
 static char s_wx_temp_buf[WX_COUNT][8];
 static char s_bank_balance_buf[20];
@@ -218,9 +218,9 @@ static char s_reset_buf[ROW_COUNT][12];
 #define BATT_H        10
 #define BT_X          130
 #define BT_Y          2
-#define BIRTHDAY_X    2
-#define BIRTHDAY_Y    17
-#define BIRTHDAY_W    24
+#define GITHUB_TOP_X  2
+#define GITHUB_TOP_Y  17
+#define GITHUB_TOP_W  46
 #define DDAY_X        119
 #define DDAY_Y        17
 #define DDAY_W        22
@@ -444,37 +444,13 @@ static int32_t active_reset(int i) {
 }
 
 static void update_provider_labels(void) {
-  text_layer_set_text(s_label_layers[0], "GHD");
+  text_layer_set_text(s_label_layers[0], s_ai_provider ? "CX 5H" : "CL 5H");
   text_layer_set_text(s_label_layers[1], s_ai_provider ? "CX 7D" : "CL 7D");
 }
 
 static void update_rows(time_t now) {
   update_provider_labels();
   for (int i = 0; i < ROW_COUNT; i++) {
-    if (i == 0) {
-      bool stale = s_github_sync <= 0 ||
-                   (int32_t)now - s_github_sync > STALE_AFTER_SEC;
-      if (s_github_commits < 0) {
-        snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "--");
-      } else {
-        snprintf(s_pct_buf[i], sizeof(s_pct_buf[i]), "%ld", (long)s_github_commits);
-      }
-      text_layer_set_text_color(s_pct_layers[i],
-                                stale ? THEMES[s_theme].stale : THEMES[s_theme].fg);
-      text_layer_set_text(s_pct_layers[i], s_pct_buf[i]);
-      if (s_github_latest <= 0) {
-        snprintf(s_reset_buf[i], sizeof(s_reset_buf[i]), "--");
-      } else {
-        time_t latest_time = (time_t)s_github_latest;
-        struct tm latest = *localtime(&latest_time);
-        struct tm today = *localtime(&now);
-        const char *format = latest.tm_year == today.tm_year &&
-                             latest.tm_yday == today.tm_yday ? "%H:%M" : "%m-%d";
-        strftime(s_reset_buf[i], sizeof(s_reset_buf[i]), format, &latest);
-      }
-      text_layer_set_text(s_reset_layers[i], s_reset_buf[i]);
-      continue;
-    }
     bool is_claude = i < 2 && !s_ai_provider;
     int32_t p = active_pct(i, now);
     bool stale = (i >= 2 && data_is_stale(now, 1)) ||
@@ -641,27 +617,15 @@ static void update_dday(time_t now) {
   text_layer_set_text(s_dday_layer, s_dday_buf);
 }
 
-// Whole local-calendar days until the next March 28. The birthday itself is
-// day zero; after it passes, the target advances to the following year.
-static void update_birthday(time_t now) {
-  time_t today_midnight = local_midnight(now);
-  struct tm birthday = *localtime(&now);
-  birthday.tm_mon = 2;  // struct tm months are zero-based
-  birthday.tm_mday = 28;
-  birthday.tm_hour = 0;
-  birthday.tm_min = 0;
-  birthday.tm_sec = 0;
-  time_t target = mktime(&birthday);
-  if (target < today_midnight) {
-    birthday.tm_year++;
-    target = mktime(&birthday);
+// Compact GitHub commit count in the top-left corner.
+static void update_github_top(void) {
+  if (s_github_commits < 0) {
+    snprintf(s_github_top_buf, sizeof(s_github_top_buf), "GHD --");
+  } else {
+    snprintf(s_github_top_buf, sizeof(s_github_top_buf), "GHD %ld",
+             (long)s_github_commits);
   }
-  int days = (int)((target - today_midnight + 43200) / 86400);
-  snprintf(s_birthday_buf, sizeof(s_birthday_buf), "%d", days);
-#ifdef WIDEST_CLOCK
-  snprintf(s_birthday_buf, sizeof(s_birthday_buf), "365");
-#endif
-  text_layer_set_text(s_birthday_layer, s_birthday_buf);
+  text_layer_set_text(s_github_top_layer, s_github_top_buf);
 }
 
 static void update_clock(struct tm *t) {
@@ -687,7 +651,7 @@ static void update_ui(void) {
   update_clock(t);
   update_countdown(t);
   update_dday(now);
-  update_birthday(now);
+  update_github_top();
   update_weather();
   update_bank();
   advance_claude_reset(now);
@@ -712,7 +676,6 @@ static void rows_update_proc(Layer *layer, GContext *ctx) {
   time_t now = time(NULL);
 
   for (int i = 0; i < ROW_COUNT; i++) {
-    if (i == 0) continue;
     bool is_claude = i < 2 && !s_ai_provider;
     int y = i * ROW_H + ROW_H - BAR_H;
     int32_t p = active_pct(i, now);
@@ -825,7 +788,7 @@ static void apply_theme(void) {
 
   text_layer_set_text_color(s_date_layer, t->fg_dim);
   text_layer_set_text_color(s_countdown_layer, t->accent);
-  text_layer_set_text_color(s_birthday_layer, t->fg_dim);
+  text_layer_set_text_color(s_github_top_layer, t->fg_dim);
   text_layer_set_text_color(s_dday_layer, t->fg);
 
   for (int i = 0; i < WX_COUNT; i++)
@@ -921,7 +884,6 @@ static void check_quota_alerts(void) {
   bool crossed = false;
 
   for (int i = 0; i < ROW_COUNT; i++) {
-    if (i == 0) continue;
     if (i < 2 && !s_ai_provider) continue;
     int32_t pct = i < 2 ? s_codex_pct[i] : s_pct[i];
     bool *alerted = i < 2 ? &s_codex_alerted[i] : &s_alerted[i];
@@ -1183,12 +1145,12 @@ static void window_load(Window *window) {
   layer_set_update_proc(s_status_layer, status_update_proc);
   layer_add_child(root, s_status_layer);
 
-  // Days until the next March 28, replacing the old AM/PM indicator.
-  s_birthday_layer = make_text(root,
-                               GRect(BIRTHDAY_X, BIRTHDAY_Y, BIRTHDAY_W, CORNER_H),
+  // Compact GitHub commit count, replacing the old top-left day indicator.
+  s_github_top_layer = make_text(root,
+                               GRect(GITHUB_TOP_X, GITHUB_TOP_Y, GITHUB_TOP_W, CORNER_H),
                                fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
                                GTextAlignmentLeft, THEMES[s_theme].fg_dim);
-  text_layer_set_text(s_birthday_layer, "");
+  text_layer_set_text(s_github_top_layer, "GHD --");
 
   // Just the number, per the brief — the target date lives in the phone's
   // settings page and is the only place it needs spelling out.
@@ -1289,7 +1251,7 @@ static void window_unload(Window *window) {
   text_layer_destroy(s_separators[1]);
   text_layer_destroy(s_separators[2]);
   text_layer_destroy(s_dday_layer);
-  text_layer_destroy(s_birthday_layer);
+  text_layer_destroy(s_github_top_layer);
   text_layer_destroy(s_countdown_layer);
   text_layer_destroy(s_date_layer);
   text_layer_destroy(s_time_layer);
@@ -1300,7 +1262,7 @@ static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   update_countdown(tick_time);
   time_t n = time(NULL);
   update_dday(n);
-  update_birthday(n);
+  update_github_top();
   advance_claude_reset(n);
   update_rows(n);
 
