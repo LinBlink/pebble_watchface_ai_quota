@@ -574,10 +574,21 @@ function fetchMiniMax() {
 
 // --- github, direct
 
-function localDateString() {
-  var d = new Date();
+function localDateString(d) {
+  d = d || new Date();
   function pad(n) { return n < 10 ? '0' + n : String(n); }
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+}
+
+function utcDateString(d) {
+  function pad(n) { return n < 10 ? '0' + n : String(n); }
+  return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate());
+}
+
+function isSameLocalDate(raw, target) {
+  var date = new Date(raw || '');
+  return !isNaN(date.getTime()) && date.getFullYear() === target.getFullYear() &&
+         date.getMonth() === target.getMonth() && date.getDate() === target.getDate();
 }
 
 // Commit Search gives an actual commit count rather than counting push events.
@@ -607,24 +618,56 @@ function fetchLatestGitHubCommit(username) {
   });
 }
 
-function fetchGitHubCommits() {
-  var username = (getSettings().githubUsername || '').trim();
-  if (!username) return;
-  var query = 'author:' + username + ' author-date:' + localDateString();
+function fetchGitHubCommitPage(username, targetDate, query, page, count, latest) {
   var url = 'https://api.github.com/search/commits?q=' + encodeURIComponent(query) +
-            '&per_page=1&sort=author-date&order=desc';
+            '&per_page=100&page=' + page + '&sort=author-date&order=desc';
   getJSON(url, githubHeaders(), function (raw) {
-    if (typeof raw.total_count !== 'number') {
+    if (!raw.items || typeof raw.total_count !== 'number') {
       console.log('github: search response has no total_count');
       return;
     }
-    send({ GITHUB_TODAY_COMMITS: raw.total_count });
-    if (raw.items && raw.items.length) {
-      sendLatestGitHubCommit(raw.items[0]);
+
+    for (var i = 0; i < raw.items.length; i++) {
+      var item = raw.items[i];
+      var authorDate = item && item.commit && item.commit.author && item.commit.author.date;
+      if (isSameLocalDate(authorDate, targetDate)) {
+        count++;
+        if (!latest) latest = item;
+      }
+    }
+
+    // GitHub Search returns at most 1,000 results. Two UTC calendar dates are
+    // enough to cover one local day; page through them so busy days are not
+    // silently capped at 100 commits.
+    if (raw.items.length === 100 && page < 10 && page * 100 < raw.total_count) {
+      fetchGitHubCommitPage(username, targetDate, query, page + 1, count, latest);
+      return;
+    }
+
+    send({ GITHUB_TODAY_COMMITS: count });
+    if (latest) {
+      sendLatestGitHubCommit(latest);
     } else {
       fetchLatestGitHubCommit(username);
     }
   });
+}
+
+function fetchGitHubCommits() {
+  var username = (getSettings().githubUsername || '').trim();
+  if (!username) return;
+  var targetDate = new Date();
+  // GitHub's author-date qualifier uses UTC calendar days while the face is
+  // displayed in phone-local time. Search the UTC dates spanning local
+  // midnight-to-midnight, then retain only commits whose author timestamp is
+  // today on the phone. This includes, for example, a 07:49 China-time commit.
+  var localStart = new Date(targetDate.getFullYear(), targetDate.getMonth(),
+                            targetDate.getDate());
+  var localEnd = new Date(targetDate.getFullYear(), targetDate.getMonth(),
+                          targetDate.getDate() + 1);
+  var query = 'author:' + username + ' author-date:' +
+              utcDateString(localStart) + '..' + utcDateString(localEnd);
+  fetchGitHubCommitPage(username, targetDate, query, 1, 0, null);
 }
 
 function refreshQuotas(force) {
